@@ -68,22 +68,20 @@ class SpeechCaptureService : Service() {
         private const val WHISPER_URL    = "http://127.0.0.1:8765/transcribe"
         private const val WHISPER_HEALTH = "http://127.0.0.1:8765/health"
 
-        // 3s chunks — captures complete sentences before Whisper sees them.
-        // 2s was cutting sentences mid-word at natural pause points (300ms VAD),
-        // producing permanent half-sentences. 3s gives enough context for
-        // Whisper to see full grammatical units in most languages.
-        private const val CHUNK_SECS    = 3.0
-        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 48 000
-        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 96 000
+        // 4s chunks — matches small model processing time (~4-5s on this CPU)
+        // and captures more complete sentences than 3s.
+        // Longer chunk = more context = better translation accuracy.
+        private const val CHUNK_SECS    = 4.0
+        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 64 000
+        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 128 000
 
-        // Queue capacity 4 = 12s of audio buffered max (4 × 3s chunks)
+        // Queue capacity 4 = 16s of audio buffered max
         private const val QUEUE_CAPACITY = 4
 
-        // Stale threshold: 3s chunk + 2.5s Whisper translate + 1s LibreTranslate + 8.5s margin
-        private const val STALE_MS           = 15_000L
+        // Stale threshold and timeouts scaled to small model + 4s chunks
+        private const val STALE_MS           = 20_000L
         private const val CONNECT_TIMEOUT_MS = 2_000
-        // Read timeout: Whisper translate ~2.5s + LibreTranslate en→hi ~1s + 11.5s margin = 15s
-        // Previous: 10s was causing disconnects because ja→en + en→hi two calls = up to 12s
+        // small model: ~4-5s Whisper + ~0.3s CT2 = ~5s + 10s margin = 15s
         private const val READ_TIMEOUT_MS    = 15_000
 
         private const val MAX_CONSECUTIVE_ERRORS = 5
