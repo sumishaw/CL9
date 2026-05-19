@@ -68,21 +68,22 @@ class SpeechCaptureService : Service() {
         private const val WHISPER_URL    = "http://127.0.0.1:8765/transcribe"
         private const val WHISPER_HEALTH = "http://127.0.0.1:8765/health"
 
-        // 4s chunks — matches small model processing time (~4-5s on this CPU)
-        // and captures more complete sentences than 3s.
-        // Longer chunk = more context = better translation accuracy.
-        private const val CHUNK_SECS    = 4.0
-        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 64 000
-        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 128 000
+        // 5s chunks — medium model takes ~18s to process.
+        // 5s chunks keep queue depth at ~3 max.
+        // Lag control on server drops old chunks so subtitles stay
+        // within ~18s of current speech — one processing window.
+        private const val CHUNK_SECS    = 5.0
+        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 80 000
+        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 160 000
 
-        // Queue capacity 4 = 16s of audio buffered max
-        private const val QUEUE_CAPACITY = 4
+        // Queue capacity 3 — medium model is slow, keep queue small
+        // Lag control on server handles overflow by dropping old chunks
+        private const val QUEUE_CAPACITY = 3
 
-        // Stale threshold and timeouts scaled to small model + 4s chunks
-        private const val STALE_MS           = 20_000L
-        private const val CONNECT_TIMEOUT_MS = 2_000
-        // small model: ~4-5s Whisper + ~0.3s CT2 = ~5s + 10s margin = 15s
-        private const val READ_TIMEOUT_MS    = 15_000
+        // medium model: ~18s Whisper + ~0.3s CT2 + 12s margin = 30s
+        private const val STALE_MS           = 30_000L
+        private const val CONNECT_TIMEOUT_MS = 3_000
+        private const val READ_TIMEOUT_MS    = 30_000
 
         private const val MAX_CONSECUTIVE_ERRORS = 5
         private const val WATCHDOG_TIMEOUT_MS    = 25_000L
