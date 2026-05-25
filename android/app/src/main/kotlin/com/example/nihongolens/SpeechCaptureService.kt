@@ -268,14 +268,19 @@ class SpeechCaptureService : Service() {
         mainHandler.post { OverlayService.updateText("", "") }
 
         captureThread = Thread({
-            // Clean 2s chunks — no overlap.
-            // Overlap was causing duplicate words: same 0.5s audio appeared
-            // in two consecutive chunks → CT2 translated same words twice.
-            // Words at exact chunk boundaries may occasionally be split but
-            // this is less harmful than the systematic duplicates from overlap.
-            val window  = ByteArray(CHUNK_BYTES)
-            var filled  = 0
-            val readBuf = ByteArray(4096)
+            // SLIDING WINDOW with 0.3s overlap (reduced from 0.5s)
+            // Overlap ensures words at chunk boundaries are never split.
+            // Server-side dedup (_remove_overlap) handles duplicate detection.
+            // 0.3s overlap is enough to catch boundary words without creating
+            // too many duplicates.
+            val OVERLAP_SAMPLES = (SAMPLE_RATE * 0.3).toInt()  // 4800 samples
+            val OVERLAP_BYTES   = OVERLAP_SAMPLES * 2           // 9600 bytes
+            val SEND_BYTES      = CHUNK_BYTES + OVERLAP_BYTES   // 2.3s total
+
+            val window   = ByteArray(SEND_BYTES)
+            var filled   = OVERLAP_BYTES
+            val readBuf  = ByteArray(4096)
+            var firstChunk = true
 
             while (capturing.get() && !Thread.currentThread().isInterrupted) {
                 val rec  = audioRecord ?: break
@@ -286,18 +291,26 @@ class SpeechCaptureService : Service() {
 
                 var src = 0
                 while (src < read) {
-                    val toCopy = minOf(read - src, CHUNK_BYTES - filled)
+                    val toCopy = minOf(read - src, SEND_BYTES - filled)
                     System.arraycopy(readBuf, src, window, filled, toCopy)
                     filled += toCopy; src += toCopy
 
-                    if (filled >= CHUNK_BYTES) {
+                    if (filled >= SEND_BYTES) {
                         if (!reconnecting) {
-                            val wav = pcmToWav(window.copyOf(CHUNK_BYTES))
-                            val job = AudioJob(wav, System.currentTimeMillis())
-                            if (!audioQueue.offer(job)) { audioQueue.poll(); audioQueue.offer(job) }
+                            if (firstChunk) {
+                                val wav = pcmToWav(window.copyOfRange(OVERLAP_BYTES, SEND_BYTES))
+                                firstChunk = false
+                                val job = AudioJob(wav, System.currentTimeMillis())
+                                if (!audioQueue.offer(job)) { audioQueue.poll(); audioQueue.offer(job) }
+                            } else {
+                                val wav = pcmToWav(window.copyOf(SEND_BYTES))
+                                val job = AudioJob(wav, System.currentTimeMillis())
+                                if (!audioQueue.offer(job)) { audioQueue.poll(); audioQueue.offer(job) }
+                            }
                             chunksSentThisSession.incrementAndGet()
                         }
-                        filled = 0
+                        System.arraycopy(window, SEND_BYTES - OVERLAP_BYTES, window, 0, OVERLAP_BYTES)
+                        filled = OVERLAP_BYTES
                     }
                 }
             }
