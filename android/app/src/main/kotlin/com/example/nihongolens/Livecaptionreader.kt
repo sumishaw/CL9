@@ -12,31 +12,31 @@ import java.net.URL
 import java.util.concurrent.LinkedBlockingQueue
 
 /**
- * LiveCaptionReader v3 — Fixed package detection
+ * LiveCaptionReader v5 — Confirmed package: com.google.android.as
  *
- * Problem: packageNames restriction was too strict, filtering ALL events.
- * Fix: Monitor all packages but strictly filter by Live Captions window
- *      characteristics (floating window + short speech-like text).
+ * Live Captions on this device (Lenovo Tab P12, Android 15) runs in:
+ *   com.google.android.as  (Android System Intelligence)
+ *
+ * This version uses a TWO-TRACK approach:
+ * Track A: Direct event text from com.google.android.as events
+ * Track B: Full tree scan of com.google.android.as window nodes
+ *
+ * Both tracks run on every event from com.google.android.as.
+ * First non-empty result wins.
  */
 class LiveCaptionReader : AccessibilityService() {
 
     companion object {
         private const val TAG = "LiveCaptionReader"
 
-        // Known Live Captions package names
-        private val LIVE_CAPTION_PACKAGES = setOf(
-            "com.google.android.as",
-            "com.google.android.accessibility.caption",
-            "com.google.android.accessibility.captions",
-            "com.google.android.tts",
-            "com.android.systemui",
-        )
+        // Confirmed package on this device
+        private const val LIVE_CAPTION_PKG = "com.google.android.as"
 
-        // View IDs used by Live Captions
-        private val CAPTION_VIEW_IDS = listOf(
-            "caption_text", "captiontext", "live_caption_text",
-            "transcript_text", "captionwindow", "caption_window",
-            "caption", "live_caption",
+        // Also monitor TTS package as fallback
+        private val MONITOR_PACKAGES = arrayOf(
+            "com.google.android.as",
+            "com.google.android.as.oss",
+            "com.google.android.tts",
         )
 
         private const val TRANSLATE_URL   = "http://127.0.0.1:8765/translate_text"
@@ -47,28 +47,20 @@ class LiveCaptionReader : AccessibilityService() {
         @Volatile var isRunning       = false
         @Volatile var lastCaptionText = ""
         @Volatile var instance: LiveCaptionReader? = null
-
-        // Detected Live Captions package (auto-detected at runtime)
-        @Volatile var detectedPackage = ""
     }
 
-    private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var pendingJob:   Job? = null
-    private var translateJob: Job? = null
-    private var lastSentText  = ""
-    private var lastHindiOut  = ""
+    private val scope         = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var pendingJob:    Job? = null
+    private var translateJob:  Job? = null
+    private var lastSentText   = ""
+    private var lastHindiOut   = ""
     private val translateQueue = LinkedBlockingQueue<String>(8)
-
-    // Track seen packages for debugging
-    private val seenPackages = mutableSetOf<String>()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance  = this
         isRunning = true
 
-        // Monitor ALL packages — we filter by content inside onAccessibilityEvent
-        // packageNames=null is required because Live Captions package name varies
         serviceInfo = serviceInfo?.also { info ->
             info.eventTypes = (
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
@@ -76,16 +68,17 @@ class LiveCaptionReader : AccessibilityService() {
                 AccessibilityEvent.TYPE_WINDOWS_CHANGED
             )
             info.feedbackType        = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            info.notificationTimeout = 100
+            info.notificationTimeout = 50
             info.flags               = (
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
             )
-            info.packageNames = null  // monitor all — filter in code
+            // Only monitor confirmed Live Captions packages
+            info.packageNames = MONITOR_PACKAGES
         }
 
         startTranslateWorker()
-        Log.i(TAG, "LiveCaptionReader connected — monitoring all packages for Live Captions")
+        Log.i(TAG, "LiveCaptionReader v5 connected — pkg=$LIVE_CAPTION_PKG")
         scope.launch(Dispatchers.Main) {
             MainActivity.instance?.onLiveCaptionReaderConnected()
         }
@@ -95,94 +88,81 @@ class LiveCaptionReader : AccessibilityService() {
         if (!isRunning || event == null) return
 
         val pkg = event.packageName?.toString() ?: return
+        if (pkg !in MONITOR_PACKAGES) return
 
-        // Log new packages for debugging (first time only)
-        if (seenPackages.add(pkg)) {
-            Log.d(TAG, "New package seen: $pkg")
-        }
+        Log.v(TAG, "Event from $pkg type=${event.eventType}")
 
-        // Strategy 1: Known Live Captions packages — process immediately
-        val isKnownCaptionPkg = pkg in LIVE_CAPTION_PACKAGES
-        if (isKnownCaptionPkg) {
-            detectedPackage = pkg
-            processEvent(event)
+        // Track A: direct event text (fastest)
+        val directText = event.text
+            ?.mapNotNull { it?.toString()?.trim() }
+            ?.filter { it.length >= 3 }
+            ?.joinToString(" ")
+            ?.trim()
+
+        if (!directText.isNullOrBlank() && isValidCaption(directText)) {
+            Log.d(TAG, "Track A: $directText")
+            onCaptionFound(directText)
             return
         }
 
-        // Strategy 2: Unknown package — check if it looks like Live Captions
-        // Live Captions window has specific characteristics
-        if (detectedPackage.isEmpty()) {
-            checkIfLiveCaptionsWindow(event, pkg)
-        }
-    }
-
-    private fun checkIfLiveCaptionsWindow(event: AccessibilityEvent, pkg: String) {
-        // Only check TYPE_WINDOWS_CHANGED events — Live Captions appears as a floating window
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED &&
-            event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
-
-        // Look for a window with known caption view IDs ONLY
+        // Track B: full tree scan of the window
         val root = try { rootInActiveWindow } catch (_: Exception) { null } ?: return
-        val captionNode = findCaptionNode(root)
-        if (captionNode != null) {
-            val text = captionNode.text?.toString()?.trim() ?: return
-            // Additional check: text should look like speech (no special chars, reasonable length)
-            if (text.length in 3..200 && text.none { it.code < 32 }) {
-                Log.i(TAG, "Live Captions auto-detected in package: $pkg — node: ${captionNode.viewIdResourceName}")
-                detectedPackage = pkg
-                scheduleTranslation(text)
-            }
+        val treeText = scanTree(root)
+        root.recycle()
+
+        if (!treeText.isNullOrBlank()) {
+            Log.d(TAG, "Track B: $treeText")
+            onCaptionFound(treeText)
         }
     }
 
-    private fun processEvent(event: AccessibilityEvent) {
-        val text = extractCaptionText(event) ?: return
-        val clean = text.trim()
-        if (clean.length < 2 || clean.length > 400) return
-        if (clean == lastCaptionText) return
-        lastCaptionText = clean
-        Log.d(TAG, "Caption: $clean")
-        scheduleTranslation(clean)
-    }
+    // ── Tree scan ─────────────────────────────────────────────────────────────
 
-    // ── Text extraction ───────────────────────────────────────────────────────
-
-    private fun extractCaptionText(event: AccessibilityEvent): String? {
-        // Method 1: Direct from event text — ONLY use when package is confirmed Live Captions
-        // Do NOT use event text from unknown packages (catches keyboard, password fields etc.)
-        val pkg = event.packageName?.toString() ?: ""
-        if (pkg in LIVE_CAPTION_PACKAGES) {
-            val evText = event.text
-                ?.mapNotNull { it?.toString()?.trim() }
-                ?.filter { it.length > 1 }
-                ?.joinToString(" ")
-            if (!evText.isNullOrBlank()) return evText
-        }
-
-        // Method 2: Walk accessibility tree — ONLY look for known caption view IDs
-        val root = try { rootInActiveWindow } catch (_: Exception) { null } ?: return null
-        return findCaptionNode(root)?.text?.toString()?.trim()
-    }
-
-    private fun findCaptionNode(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+    private fun scanTree(node: AccessibilityNodeInfo?): String? {
         node ?: return null
-        val viewId = node.viewIdResourceName?.lowercase() ?: ""
-        val text   = node.text?.toString()?.trim() ?: ""
 
-        // ONLY match known Live Captions view IDs — never generic TextViews
-        // This prevents reading from keyboard, password fields, URLs, etc.
-        if (CAPTION_VIEW_IDS.any { viewId.contains(it) } && text.isNotBlank()) {
-            return node
+        val text   = node.text?.toString()?.trim() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+        val cls    = node.className?.toString()?.lowercase() ?: ""
+
+        // Priority 1: known caption view IDs
+        if (listOf("caption_text", "captiontext", "live_caption_text",
+                "transcript", "caption_window").any { viewId.contains(it) }
+            && text.isNotBlank()) {
+            return text
         }
 
+        // Priority 2: any text view with valid speech text
+        if (cls.contains("textview") && isValidCaption(text)) {
+            return text
+        }
+
+        // Recurse
         for (i in 0 until node.childCount) {
-            val found = findCaptionNode(node.getChild(i))
+            val found = scanTree(node.getChild(i))
             if (found != null) return found
         }
         return null
     }
 
-    // ── Translation pipeline ──────────────────────────────────────────────────
+    private fun isValidCaption(text: String): Boolean {
+        if (text.length < 3 || text.length > 350) return false
+        val letters = text.count { it.isLetter() }
+        if (letters < text.length * 0.4) return false
+        if (text.contains("http") || text.contains("www.")) return false
+        if (text.contains("com.") || text.contains("android.")) return false
+        return true
+    }
+
+    // ── Caption found ─────────────────────────────────────────────────────────
+
+    private fun onCaptionFound(text: String) {
+        if (text == lastCaptionText) return
+        lastCaptionText = text
+        scheduleTranslation(text)
+    }
+
+    // ── Debounce + queue ──────────────────────────────────────────────────────
 
     private fun scheduleTranslation(text: String) {
         pendingJob?.cancel()
@@ -208,8 +188,7 @@ class LiveCaptionReader : AccessibilityService() {
                 if (hindi.isBlank() || hindi == lastHindiOut) continue
                 lastHindiOut = hindi
 
-                Log.d(TAG, "Hindi: $hindi")
-                Log.d(TAG, "Source pkg: $detectedPackage")
+                Log.i(TAG, "✓ [${text.take(40)}] → [${hindi.take(40)}]")
                 SpeechCaptureService.latestHindi   = hindi
                 SpeechCaptureService.latestEnglish = text
 
@@ -220,6 +199,8 @@ class LiveCaptionReader : AccessibilityService() {
             }
         }
     }
+
+    // ── HTTP translation ──────────────────────────────────────────────────────
 
     private fun translate(text: String): String? {
         var conn: HttpURLConnection? = null
