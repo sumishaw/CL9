@@ -68,6 +68,11 @@ class MainActivity : FlutterActivity() {
         methodChannel?.setMethodCallHandler { call, result ->
             when (call.method) {
 
+                "openAccessibilitySettings" -> {
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    result.success(true)
+                }
+
                 "hasOverlayPermission" ->
                     result.success(Settings.canDrawOverlays(this))
 
