@@ -1,12 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-    packageNames intentionally omitted — Live Captions package name varies
-    by device/Android version. We filter by content in LiveCaptionReader.kt.
--->
+<!-- Confirmed package on Lenovo Tab P12 Android 15: com.google.android.as -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"
     android:accessibilityEventTypes="typeWindowContentChanged|typeViewTextChanged|typeWindowsChanged"
     android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:notificationTimeout="100"
-    android:canRetrieveWindowContent="true" />
+    android:notificationTimeout="50"
+    android:canRetrieveWindowContent="true"
+    android:packageNames="com.google.android.as,com.google.android.as.oss,com.google.android.tts" />
