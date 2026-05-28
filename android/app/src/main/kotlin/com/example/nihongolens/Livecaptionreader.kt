@@ -165,7 +165,8 @@ class LiveCaptionReader : AccessibilityService() {
         if (lower.contains("united states") || lower.contains("united kingdom")) return true
         if (lower.contains("english") && lower.length < 40) return true
         if (lower.contains("japanese") && lower.length < 40) return true
-        if (lower.contains("chinese") || lower.contains("korean")) return true
+        if (lower.contains("chinese") && lower.length < 40) return true
+        if (lower.contains("korean") && lower.length < 40) return true
         if (lower.contains("español") || lower.contains("français")) return true
         // Skip single words that are likely UI buttons
         if (!text.contains(" ") && text.length < 15) return true
@@ -235,7 +236,7 @@ class LiveCaptionReader : AccessibilityService() {
             conn.doOutput       = true
             conn.connectTimeout = CONNECT_TIMEOUT
             conn.readTimeout    = READ_TIMEOUT
-            val body = """{"text":${JSONObject.quote(text)},"src":"en","tgt":"hi"}"""
+            val body = """{"text":${JSONObject.quote(text)},"src":"auto","tgt":"hi"}"""
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             if (conn.responseCode != 200) return null
             val resp = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
