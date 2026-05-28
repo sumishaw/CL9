@@ -255,6 +255,13 @@ class MainActivity : FlutterActivity() {
      * Called by SpeechCaptureService when whisper becomes unreachable.
      * Updates the Flutter model-status card to show the error state.
      */
+    fun onLiveCaptionReaderConnected() {
+        Log.i(TAG, "LiveCaptionReader connected")
+        mainHandler.post {
+            methodChannel?.invokeMethod("onLiveCaptionReaderConnected", null)
+        }
+    }
+
     fun notifyWhisperDisconnected() {
         runOnUiThread {
             Log.w(TAG, "Notifying Flutter: whisper disconnected")
