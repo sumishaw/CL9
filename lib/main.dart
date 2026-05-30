@@ -308,8 +308,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
             ],
           ),
         ),
-      ),
-    );
+      );
   }
 
   // ── Log tab ───────────────────────────────────────────────────────────────
@@ -413,7 +412,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       decoration: BoxDecoration(
         shape: BoxShape.circle,
         color: isRunning
-            ? (_pulse ? Colors.red : Colors.red.withOpacity(0.5))
+            ? (_pulse ? Colors.red : Colors.red.withAlpha(128))
             : Colors.white12,
       ),
       child: const Icon(Icons.subtitles, color: Colors.white, size: 20),
@@ -445,9 +444,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.blue.withOpacity(0.08),
+        color: Colors.blue.withAlpha(20),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.blue.withOpacity(0.2)),
+        border: Border.all(color: Colors.blue.withAlpha(51)),
       ),
       child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const Icon(Icons.info_outline, color: Colors.blue, size: 16),
@@ -480,8 +479,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       case ModelState.notReady:
         return _cardShell(
           icon: Icons.cloud_off, iconColor: Colors.orangeAccent,
-          borderColor: Colors.orange.withOpacity(0.4),
-          bgColor: Colors.orange.withOpacity(0.06),
+          borderColor: Colors.orange.withAlpha(102),
+          bgColor: Colors.orange.withAlpha(15),
           title: 'Translation Server Not Running',
           subtitle: 'Run in Termux:\npython3 whisper_server.py',
           trailing: ElevatedButton(
@@ -497,8 +496,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       case ModelState.ready:
         return _cardShell(
           icon: Icons.check_circle, iconColor: Colors.greenAccent,
-          borderColor: Colors.greenAccent.withOpacity(0.3),
-          bgColor: Colors.green.withOpacity(0.06),
+          borderColor: Colors.greenAccent.withAlpha(77),
+          bgColor: Colors.green.withAlpha(15),
           title: 'Translation Server Ready',
           subtitle: 'CT2 opus-mt-en-hi · Hindi output · No censoring',
           trailing: const Icon(Icons.check, color: Colors.greenAccent, size: 20),
@@ -506,8 +505,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
       case ModelState.error:
         return _cardShell(
           icon: Icons.error_outline, iconColor: Colors.redAccent,
-          borderColor: Colors.red.withOpacity(0.4),
-          bgColor: Colors.red.withOpacity(0.06),
+          borderColor: Colors.red.withAlpha(102),
+          bgColor: Colors.red.withAlpha(15),
           title: 'Translation Server Unreachable',
           subtitle: modelErrorMsg.isNotEmpty ? modelErrorMsg : 'Start whisper_server.py then tap RETRY',
           trailing: ElevatedButton(
@@ -562,7 +561,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
     decoration: BoxDecoration(
       color: const Color(0xFF111111),
       borderRadius: BorderRadius.circular(10),
-      border: Border.all(color: granted ? Colors.greenAccent.withOpacity(0.3) : Colors.white12),
+      border: Border.all(color: granted ? Colors.greenAccent.withAlpha(77) : Colors.white12),
     ),
     child: Row(children: [
       Icon(icon, color: iconColor, size: 20),
@@ -623,7 +622,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
           duration: const Duration(milliseconds: 180),
           padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 10),
           decoration: BoxDecoration(
-            color: sel ? const Color(0xFFFF3B3B).withOpacity(0.15) : const Color(0xFF1E1E1E),
+            color: sel ? const Color(0x26FF3B3B) : const Color(0xFF1E1E1E),
             borderRadius: BorderRadius.circular(10),
             border: Border.all(color: sel ? const Color(0xFFFF3B3B) : Colors.white12),
           ),
@@ -635,7 +634,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
               fontSize: 12, fontWeight: sel ? FontWeight.bold : FontWeight.normal,
             )),
             Text(sublabel, style: TextStyle(
-              color: sel ? Colors.redAccent.withOpacity(0.7) : Colors.white24,
+              color: sel ? Colors.redAccent.withAlpha(179) : Colors.white24,
               fontSize: 10,
             )),
           ]),
@@ -649,7 +648,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
     decoration: BoxDecoration(
       color: const Color(0xFF0a1628),
       borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: Colors.blue.withOpacity(0.2)),
+      border: Border.all(color: Colors.blue.withAlpha(51)),
     ),
     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const Text('Detects & Translates',
@@ -720,9 +719,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
           width: double.infinity,
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            color: Colors.green.withOpacity(0.08),
+            color: Colors.green.withAlpha(20),
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.greenAccent.withOpacity(0.3)),
+            border: Border.all(color: Colors.greenAccent.withAlpha(77)),
           ),
           child: Text(displayText,
               style: const TextStyle(
@@ -736,9 +735,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
   Widget _buildStatusBanner() => Container(
     padding: const EdgeInsets.all(12),
     decoration: BoxDecoration(
-      color: Colors.orange.withOpacity(0.1),
+      color: Colors.orange.withAlpha(26),
       borderRadius: BorderRadius.circular(8),
-      border: Border.all(color: Colors.orange.withOpacity(0.3)),
+      border: Border.all(color: Colors.orange.withAlpha(77)),
     ),
     child: Row(children: [
       const Icon(Icons.info_outline, color: Colors.orange, size: 16),
@@ -783,7 +782,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver, Single
   Widget _chip(String label) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
     decoration: BoxDecoration(
-      color: Colors.white.withOpacity(0.06),
+      color: Colors.white.withAlpha(15),
       borderRadius: BorderRadius.circular(20),
       border: Border.all(color: Colors.white12),
     ),
