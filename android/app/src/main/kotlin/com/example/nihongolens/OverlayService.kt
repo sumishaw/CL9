@@ -11,16 +11,21 @@ import android.util.TypedValue
 import android.view.*
 import android.widget.*
 import androidx.core.app.NotificationCompat
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * OverlayService — Hindi subtitle overlay
  *
- * - Single TextView, maxLines=2, wraps naturally
- * - FIFO queue: every translation shown in order, nothing dropped
- * - READ_MS: each subtitle stays 7s before advancing
- * - Backlog mode: if 3+ queued, advance every 3.5s to catch up
- * - SILENCE_MS: fade out after 10s with no new text
- * - One timer only: readRunnable always cancelled before creating new one
+ * FIFO + Token design:
+ *   - Every translation pushed to queue gets a monotonically increasing token
+ *   - Display loop only shows item whose token == expectedToken
+ *   - On clearQueue(), expectedToken is advanced past all pending tokens
+ *     → stale items silently discarded when dequeued, no duplicate/stale display
+ *   - One advance() timer at a time — token on the timer's Runnable must
+ *     still match expectedToken when it fires, otherwise it's a stale timer
+ *
+ * READ_MS = 4s — comfortable reading pace, matches live speech rhythm
+ * SILENCE_MS = 8s — fade after speech ends
  */
 class OverlayService : Service() {
 
@@ -30,23 +35,39 @@ class OverlayService : Service() {
 
         @Volatile var latestOriginal = ""
         @Volatile var latestHindi    = ""
-        @Volatile private var pushCallback: ((String, String) -> Unit)? = null
+        @Volatile private var pushCallback:  ((String, String) -> Unit)? = null
+        @Volatile private var clearCallback: (() -> Unit)?               = null
 
         fun updateText(original: String, hindi: String) {
             latestOriginal = original
             latestHindi    = hindi
             pushCallback?.invoke(original, hindi)
         }
+
+        fun clearQueue() { clearCallback?.invoke() }
     }
 
-    private val READ_MS    = 7_000L
-    private val SILENCE_MS = 10_000L
+    // Token counter — each queued item gets a unique token
+    private val tokenCounter  = AtomicLong(0)
+    // Only display items whose token >= expectedToken
+    // Advancing expectedToken past pending tokens discards stale items
+    private var expectedToken = 0L
 
-    // FIFO — never drops
-    private val queue       = ArrayDeque<String>()
+    data class QueueItem(val token: Long, val text: String)
+
+    private val queue       = ArrayDeque<QueueItem>()
     private var currentText = ""
     private var showing     = false
 
+    // READ_MS: how long each subtitle stays visible
+    // 4s = comfortable reading time for 1-2 lines of Hindi
+    // Backlog (3+ waiting): 2s so we don't fall too far behind
+    private val READ_MS_NORMAL  = 4_000L
+    private val READ_MS_BACKLOG = 2_000L
+    private val SILENCE_MS      = 8_000L
+
+    // Active advance timer — carries its own token to detect stale timers
+    private var timerToken:      Long     = -1L
     private var readRunnable:    Runnable? = null
     private var silenceRunnable: Runnable? = null
 
@@ -75,7 +96,8 @@ class OverlayService : Service() {
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         handler.post { if (running) buildOverlay() }
-        pushCallback = { _, hindi -> handler.post { onNewHindi(hindi) } }
+        pushCallback  = { _, hindi -> handler.post { onNewHindi(hindi) } }
+        clearCallback = { handler.post { onClearQueue() } }
     }
 
     override fun onStartCommand(i: Intent?, f: Int, s: Int) = START_STICKY
@@ -83,7 +105,8 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         running = false
-        pushCallback = null
+        pushCallback  = null
+        clearCallback = null
         handler.removeCallbacksAndMessages(null)
         queue.clear()
         if (viewAdded) {
@@ -93,53 +116,81 @@ class OverlayService : Service() {
         super.onDestroy()
     }
 
-    // ── Core display logic ────────────────────────────────────────────────────
+    // ── Queue management ──────────────────────────────────────────────────────
 
     private fun onNewHindi(hindi: String) {
         if (hindi.isBlank()) return
         val t = hindi.trim()
 
-        // Skip exact duplicate of what's on screen if nothing else waiting
+        // Skip exact duplicate of what's on screen if queue empty
         if (t == currentText && queue.isEmpty()) {
             rescheduleSilence(); return
         }
 
-        queue.addLast(t)          // FIFO add
+        val token = tokenCounter.incrementAndGet()
+        queue.addLast(QueueItem(token, t))   // FIFO
         rescheduleSilence()
 
-        // Kick display only if idle — if already showing, readRunnable will advance
+        // Kick display only if idle
         if (!showing) advance()
     }
 
     /**
-     * Advance to the next queued item.
-     * Always cancels existing readRunnable before doing anything.
-     * This is the ONLY place readRunnable is created.
+     * Discard all queued items when LC window disappears.
+     * Advances expectedToken past all pending tokens — any already-scheduled
+     * advance() timer will see its token < expectedToken and skip silently.
+     */
+    private fun onClearQueue() {
+        val dropped = queue.size
+        // Set expectedToken to one past the highest issued token
+        expectedToken = tokenCounter.get() + 1
+        queue.clear()
+        cancelTimer()
+        android.util.Log.d("OverlayService", "clearQueue: dropped=$dropped expectedToken=$expectedToken")
+    }
+
+    // ── Display loop ──────────────────────────────────────────────────────────
+
+    /**
+     * Show next valid item from queue.
+     * Items with token < expectedToken are stale — skip them.
+     * Creates exactly one readRunnable timer carrying the displayed item's token.
      */
     private fun advance() {
-        // Cancel any existing timer — one timer at a time
-        readRunnable?.let { handler.removeCallbacks(it) }
-        readRunnable = null
+        cancelTimer()
 
-        if (queue.isEmpty()) {
-            // Nothing to show — stay on current text until silence
-            return
+        // Drain stale items
+        while (queue.isNotEmpty() && queue.first().token < expectedToken) {
+            queue.removeFirst()
         }
 
-        val text   = queue.removeFirst()   // FIFO remove
-        currentText = text
-        showing     = true
-        display(text)
+        if (queue.isEmpty()) return  // nothing to show, stay on current until silence
 
-        // Schedule next advance
-        val waitMs = if (queue.size >= 3) READ_MS / 2 else READ_MS
+        val item = queue.removeFirst()
+        if (item.token < expectedToken) return  // double-check after removal
+
+        currentText = item.text
+        showing     = true
+        display(item.text)
+
+        // Schedule next advance with this item's token
+        val capturedToken = item.token
+        timerToken        = capturedToken
+        val waitMs        = if (queue.size >= 3) READ_MS_BACKLOG else READ_MS_NORMAL
         readRunnable = Runnable {
             readRunnable = null
             if (!running) return@Runnable
-            if (queue.isNotEmpty()) advance()
-            // else: stay on screen until silence or new text
+            // Stale timer check: if expectedToken advanced past our token, discard
+            if (capturedToken < expectedToken) return@Runnable
+            advance()
         }
         handler.postDelayed(readRunnable!!, waitMs)
+    }
+
+    private fun cancelTimer() {
+        readRunnable?.let { handler.removeCallbacks(it) }
+        readRunnable = null
+        timerToken   = -1L
     }
 
     private fun display(text: String) {
@@ -147,16 +198,15 @@ class OverlayService : Service() {
         tv.animate().cancel()
         tv.alpha = 0f
         tv.text  = text
-        tv.animate().alpha(1f).setDuration(180).start()
+        tv.animate().alpha(1f).setDuration(150).start()
     }
 
     private fun rescheduleSilence() {
         silenceRunnable?.let { handler.removeCallbacks(it) }
         silenceRunnable = Runnable {
             if (!running) return@Runnable
-            if (queue.isNotEmpty()) return@Runnable  // new content arrived — don't clear
-            readRunnable?.let { handler.removeCallbacks(it) }
-            readRunnable = null
+            if (queue.isNotEmpty()) return@Runnable  // new content arrived
+            cancelTimer()
             textView?.animate()?.alpha(0f)?.setDuration(400)?.withEndAction {
                 currentText = ""; showing = false
             }?.start()
@@ -203,7 +253,6 @@ class OverlayService : Service() {
                 y = dp(90)
             }
 
-            // Draggable
             var sx = 0f; var sy = 0f; var ix = 0; var iy = 0
             tv.setOnTouchListener { _, ev ->
                 val p = params ?: return@setOnTouchListener false
