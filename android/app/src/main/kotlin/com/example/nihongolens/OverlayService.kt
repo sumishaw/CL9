@@ -38,9 +38,14 @@ class OverlayService : Service() {
         fun clearQueue() { clearCallback?.invoke() }
     }
 
-    private val WORD_INTERVAL_MS = 300L   // ms between words
-    private val HOLD_MS          = 2_000L // hold after sentence complete
-    private val SILENCE_MS       = 8_000L // fade after no speech
+    // ── Timing ────────────────────────────────────────────────────────────────
+    // Words appear instantly (0ms gap) — fills 2 lines fast matching speech pace
+    // When 2 lines full: hold HOLD_MS so user can read, then clear and continue
+    // LINE_CHARS: approximate chars that fit 2 lines at 20sp on a tablet
+    private val WORD_INTERVAL_MS = 0L      // instant — words pop in fast
+    private val HOLD_MS          = 3_500L  // read time when 2 lines full
+    private val SILENCE_MS       = 8_000L  // fade after no speech
+    private val LINE_CHARS       = 52      // ~26 chars per line × 2 lines
 
     private val tokenCounter  = AtomicLong(0)
     private var expectedToken = 0L
@@ -48,7 +53,7 @@ class OverlayService : Service() {
     data class Item(val token: Long, val words: List<String>)
     private val queue = ArrayDeque<Item>()
 
-    private var currentWords  = listOf<String>()
+    private var currentWords  = listOf<String>()   // kept for compat — not used in display
     private var wordIndex     = 0
     private var displayedText = ""
     private var isProgressing = false
@@ -117,12 +122,15 @@ class OverlayService : Service() {
         queue.addLast(Item(token, words))
         reschedSilence()
         if (!isProgressing) startNext()
+        // If progressing, new words will be picked up by holdThenWait or next tickWords cycle
     }
 
     private fun onClear() {
         expectedToken = tokenCounter.get() + 1
         queue.clear()
         cancelAll()
+        allWords      = listOf()
+        allIndex      = 0
         isProgressing = false
         currentToken  = -1L
         hideText()
@@ -130,65 +138,109 @@ class OverlayService : Service() {
 
     // ── Progressive display ───────────────────────────────────────────────────
 
+    // allWords: flat list of all words from all currently queued sentences
+    // Rebuilt whenever startNext() or onPush() kicks display
+    private var allWords   = listOf<String>()
+    private var allIndex   = 0
+
     private fun startNext() {
         cancelAll()
         while (queue.isNotEmpty() && queue.first().token < expectedToken)
             queue.removeFirst()
         if (queue.isEmpty()) { isProgressing = false; return }
 
-        val item = queue.removeFirst()
-        if (item.token < expectedToken) { startNext(); return }
+        // Drain ALL queued sentences into one flat word list
+        // This lets us fill 2 lines with content from multiple sentences
+        val words = mutableListOf<String>()
+        val tokens = mutableListOf<Long>()
+        while (queue.isNotEmpty()) {
+            val item = queue.removeFirst()
+            if (item.token < expectedToken) continue
+            words.addAll(item.words)
+            tokens.add(item.token)
+        }
+        if (words.isEmpty()) { isProgressing = false; return }
 
-        currentWords  = item.words
-        currentToken  = item.token
-        wordIndex     = 0
+        allWords      = words
+        allIndex      = 0
+        currentToken  = tokens.last()
         isProgressing = true
         displayedText = ""
         hideText()
-        scheduleNextWord()
+        tickWords()
     }
 
-    private fun scheduleNextWord() {
-        wordRunnable = Runnable {
-            wordRunnable = null
-            if (!running || currentToken < expectedToken) {
-                isProgressing = false; hideText(); return@Runnable
-            }
-            if (wordIndex >= currentWords.size) {
-                // Sentence done — hold then advance
-                holdThenNext(); return@Runnable
-            }
-
-            displayedText = if (displayedText.isEmpty()) currentWords[wordIndex]
-                            else "$displayedText ${currentWords[wordIndex]}"
-            wordIndex++
-            showText(displayedText)
-
-            // If text exceeds ~2 lines (40 chars), hold then show remainder
-            if (displayedText.length >= 40 && wordIndex < currentWords.size) {
-                holdRunnable = Runnable {
-                    holdRunnable = null
-                    if (!running || currentToken < expectedToken) { startNext(); return@Runnable }
-                    displayedText = ""
-                    hideText()
-                    scheduleNextWord()
-                }
-                handler.postDelayed(holdRunnable!!, HOLD_MS)
-            } else {
-                scheduleNextWord()
-            }
+    private fun tickWords() {
+        wordRunnable = null
+        if (!running || currentToken < expectedToken) {
+            isProgressing = false; hideText(); return
         }
-        handler.postDelayed(wordRunnable!!, WORD_INTERVAL_MS)
+
+        if (allIndex >= allWords.size) {
+            // All words shown — hold then wait for new content
+            holdThenWait(); return
+        }
+
+        // Append next word
+        val word = allWords[allIndex++]
+        displayedText = if (displayedText.isEmpty()) word else "$displayedText $word"
+        showText(displayedText)
+
+        // Check if 2 lines are full
+        if (displayedText.length >= LINE_CHARS) {
+            // 2 lines full — hold so user can read, then clear and continue
+            val cap = currentToken
+            holdRunnable = Runnable {
+                holdRunnable = null
+                if (!running || cap < expectedToken) { hideText(); isProgressing = false; return@Runnable }
+                displayedText = ""
+                hideText()
+                // If more words remain in allWords, continue ticking
+                if (allIndex < allWords.size) {
+                    tickWords()
+                } else if (queue.isNotEmpty()) {
+                    startNext()
+                } else {
+                    isProgressing = false
+                }
+            }
+            handler.postDelayed(holdRunnable!!, HOLD_MS)
+            return
+        }
+
+        // More words — schedule next immediately or after interval
+        wordRunnable = Runnable { tickWords() }
+        if (WORD_INTERVAL_MS > 0) handler.postDelayed(wordRunnable!!, WORD_INTERVAL_MS)
+        else handler.post(wordRunnable!!)
     }
 
-    private fun holdThenNext() {
+    private fun holdThenWait() {
         val cap = currentToken
         holdRunnable = Runnable {
             holdRunnable = null
             if (!running) return@Runnable
-            if (cap < expectedToken) { isProgressing = false; hideText(); startNext(); return@Runnable }
+            if (cap < expectedToken) { isProgressing = false; hideText(); return@Runnable }
+            if (queue.isNotEmpty()) {
+                // Seamlessly continue with newly arrived sentences
+                val words = mutableListOf<String>()
+                val tokens = mutableListOf<Long>()
+                while (queue.isNotEmpty()) {
+                    val item = queue.removeFirst()
+                    if (item.token < expectedToken) continue
+                    words.addAll(item.words)
+                    tokens.add(item.token)
+                }
+                if (words.isNotEmpty()) {
+                    // Append new words to current display without clearing
+                    allWords  = allWords + words
+                    currentToken = tokens.last()
+                    tickWords()
+                    return@Runnable
+                }
+            }
+            // Nothing new — clear and wait
             hideText()
-            startNext()
+            isProgressing = false
         }
         handler.postDelayed(holdRunnable!!, HOLD_MS)
     }
