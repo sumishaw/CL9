@@ -151,23 +151,18 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
+                "setSubtitleSpeed" -> {
+                    val seconds = (call.argument<Double>("seconds") ?: 3.5)
+                    OverlayService.setHoldMs((seconds * 1000).toLong())
+                    result.success(true)
+                }
+
                 "getLatestTranslation" ->
                     result.success(mapOf(
                         "original" to SpeechCaptureService.latestOriginal,
                         "english"  to SpeechCaptureService.latestEnglish,
                         "hindi"    to SpeechCaptureService.latestHindi
                     ))
-
-                "getLogs" -> {
-                    // Return last 200 lines from the in-memory log queue as a string
-                    val lines = CaptionLogger.getRecentLines(200)
-                    result.success(lines)
-                }
-
-                "clearLogs" -> {
-                    CaptionLogger.clearLines()
-                    result.success(true)
-                }
 
                 else -> result.notImplemented()
             }
@@ -178,9 +173,6 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Start file logger — writes to /sdcard/caption_lens_log.txt
-        CaptionLogger.init(this)
-        CaptionLogger.log("MainActivity", "App started — log: ${CaptionLogger.getLogPath()}")
         checkAndNotifyWhisperReady()
     }
 
