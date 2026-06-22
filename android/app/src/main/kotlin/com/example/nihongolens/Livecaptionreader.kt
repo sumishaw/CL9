@@ -372,8 +372,9 @@ class LiveCaptionReader : AccessibilityService() {
 
                 // Auto gender: use server-detected language for best accuracy
                 if (HindiTtsService.selectedGender == HindiTtsService.Gender.AUTO) {
-                    HindiTtsService.detectedGender =
-                        GenderDetector.detect(text, serverLang.ifBlank { confirmedLang })
+                    GenderDetector.detect(text, serverLang.ifBlank { confirmedLang })
+                        ?.let { HindiTtsService.detectedGender = it }
+                    HindiTtsService.updateGenderFromText(text, serverLang.ifBlank { confirmedLang })
                 }
 
                 withContext(Dispatchers.Main) {
