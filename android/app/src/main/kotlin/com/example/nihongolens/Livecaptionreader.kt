@@ -370,13 +370,6 @@ class LiveCaptionReader : AccessibilityService() {
                 SpeechCaptureService.latestHindi   = hindi
                 SpeechCaptureService.latestEnglish = text
 
-                // Auto gender: use server-detected language for best accuracy
-                if (HindiTtsService.selectedGender == HindiTtsService.Gender.AUTO) {
-                    GenderDetector.detect(text, serverLang.ifBlank { confirmedLang })
-                        ?.let { HindiTtsService.detectedGender = it }
-                    HindiTtsService.updateGenderFromText(text, serverLang.ifBlank { confirmedLang })
-                }
-
                 withContext(Dispatchers.Main) {
                     OverlayService.updateText(text, hindi)
                     MainActivity.instance?.onTranslation(text, hindi, hindi)
