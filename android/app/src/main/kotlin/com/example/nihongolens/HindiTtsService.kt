@@ -279,33 +279,100 @@ object HindiTtsService {
 
     private fun startGenderPoller() {
         genderJob = scope.launch {
+            val SR      = 16_000
+            val SAMPLES = 16_000 * 2  // 2 seconds of audio per sample
+            val minBuf  = AudioRecord.getMinBufferSize(
+                SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+
+            // Try audio sources in order — UNPROCESSED may capture system audio on some devices
+            var rec: AudioRecord? = null
+            for (src in intArrayOf(
+                MediaRecorder.AudioSource.UNPROCESSED,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC)) {
+                try {
+                    val r = AudioRecord(src, SR, AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, SAMPLES * 2))
+                    if (r.state == AudioRecord.STATE_INITIALIZED) {
+                        rec = r
+                        Log.d(TAG, "AudioRecord started src=$src")
+                        break
+                    }
+                    r.release()
+                } catch (_: Exception) {}
+            }
+
+            if (rec == null) {
+                Log.e(TAG, "AudioRecord init failed — gender detection unavailable")
+                return@launch
+            }
+
+            rec.startRecording()
+            val buf = ShortArray(SAMPLES)
+
             while (isActive) {
-                if (selectedGender == Gender.AUTO && !isSuppressed()) {
-                    try {
-                        val conn = URL(GENDER_URL).openConnection() as HttpURLConnection
-                        conn.connectTimeout = 1_500; conn.readTimeout = 2_000
-                        if (conn.responseCode == 200) {
-                            val json = JSONObject(conn.inputStream.bufferedReader().readText())
-                            val g    = json.optString("gender", "")
-                            val conf = json.optInt("confidence", 0)
-                            if ((g == "female" || g == "male") && conf >= 2) {
-                                val newG = if (g == "female") Gender.FEMALE else Gender.MALE
-                                genderHistory.addLast(newG)
-                                if (genderHistory.size > GENDER_HIST) genderHistory.removeFirst()
-                                val fCount = genderHistory.count { it == Gender.FEMALE }
-                                val majority = if (fCount > genderHistory.size / 2)
-                                    Gender.FEMALE else Gender.MALE
-                                if (majority != detectedGender) {
-                                    detectedGender = majority
-                                    Log.d(TAG, "Gender → $majority ($g conf=$conf)")
-                                }
+                // Skip during TTS — avoid self-detection
+                if (isSuppressed()) { delay(500); continue }
+                if (selectedGender != Gender.AUTO) { delay(2_000); continue }
+
+                // Collect 2s of audio
+                var read = 0
+                while (read < SAMPLES && isActive) {
+                    val n = rec.read(buf, read, SAMPLES - read)
+                    if (n > 0) read += n else break
+                }
+                if (read < SAMPLES / 2) { delay(200); continue }
+
+                // Check RMS — skip silence
+                var sumSq = 0.0
+                for (i in 0 until read) sumSq += buf[i].toLong() * buf[i]
+                val rms = kotlin.math.sqrt(sumSq / read)
+                if (rms < 80) { delay(500); continue }  // silence
+
+                // Convert ShortArray to ByteArray and POST to server
+                val pcmBytes = ByteArray(read * 2)
+                for (i in 0 until read) {
+                    pcmBytes[i * 2]     = (buf[i].toInt() and 0xFF).toByte()
+                    pcmBytes[i * 2 + 1] = (buf[i].toInt() shr 8 and 0xFF).toByte()
+                }
+
+                try {
+                    val conn = URL("http://127.0.0.1:8765/analyze_audio")
+                        .openConnection() as HttpURLConnection
+                    conn.requestMethod  = "POST"
+                    conn.doOutput       = true
+                    conn.connectTimeout = 2_000
+                    conn.readTimeout    = 3_000
+                    conn.setRequestProperty("Content-Type", "application/octet-stream")
+                    conn.setRequestProperty("Content-Length", pcmBytes.size.toString())
+                    conn.outputStream.write(pcmBytes)
+
+                    if (conn.responseCode == 200) {
+                        val json = JSONObject(conn.inputStream.bufferedReader().readText())
+                        val g    = json.optString("gender", "")
+                        val conf = json.optInt("confidence", 0)
+                        if (g == "female" || g == "male") {
+                            val newG = if (g == "female") Gender.FEMALE else Gender.MALE
+                            genderHistory.addLast(newG)
+                            if (genderHistory.size > GENDER_HIST) genderHistory.removeFirst()
+                            val fCount = genderHistory.count { it == Gender.FEMALE }
+                            val majority = if (fCount > genderHistory.size / 2)
+                                Gender.FEMALE else Gender.MALE
+                            if (majority != detectedGender) {
+                                detectedGender = majority
+                                Log.d(TAG, "Gender → $majority (rms=${rms.toInt()} g=$g conf=$conf)")
                             }
                         }
-                        conn.disconnect()
-                    } catch (_: Exception) {}
+                    }
+                    conn.disconnect()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Gender POST: ${e.message}")
                 }
-                delay(2_000)
+
+                delay(1_500)  // analyze every 1.5s
             }
+
+            try { rec.stop(); rec.release() } catch (_: Exception) {}
         }
     }
 
