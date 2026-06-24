@@ -303,27 +303,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    return DefaultTabController(
-      length: 2,
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        appBar: PreferredSize(
-          preferredSize: const Size.fromHeight(48),
-          child: TabBar(
-            onTap: (i) => setState(() => _logTab = i),
-            labelColor: Colors.redAccent,
-            unselectedLabelColor: Colors.white38,
-            indicatorColor: Colors.redAccent,
-            tabs: [
-              const Tab(text: 'CAPTIONS'),
-              Tab(text: 'LOGS  ${_logLines.isNotEmpty ? "(${_logLines.length})" : ""}'),
-            ],
-          ),
-        ),
-        body: SafeArea(
-          child: TabBarView(
-            physics: const NeverScrollableScrollPhysics(),
-            children: [
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Column(
+          children: [
+            // ── Tab bar ────────────────────────────────────────────────────
+            Row(children: [
+              _tabButton('CAPTIONS', 0),
+              _tabButton('LOGS${_logLines.isNotEmpty ? " (${_logLines.length})" : ""}', 1),
+            ]),
+            const Divider(height: 1, color: Colors.white12),
+            Expanded(
+              child: IndexedStack(
+                index: _logTab,
+                children: [
               // ── Tab 0: Main captions UI ─────────────────────────────────
               SingleChildScrollView(
                 padding: const EdgeInsets.all(20),
@@ -376,7 +370,39 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ),
               // ── Tab 1: Log viewer ────────────────────────────────────────
               _buildLogTab(),
-            ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _tabButton(String label, int idx) {
+    final active = _logTab == idx;
+    return Expanded(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => setState(() => _logTab = idx),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          decoration: BoxDecoration(
+            border: Border(
+              bottom: BorderSide(
+                color: active ? Colors.redAccent : Colors.transparent,
+                width: 2,
+              ),
+            ),
+          ),
+          child: Text(
+            label,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: active ? Colors.redAccent : Colors.white38,
+              fontSize: 13,
+              fontWeight: active ? FontWeight.bold : FontWeight.normal,
+            ),
           ),
         ),
       ),
