@@ -469,8 +469,7 @@ class LiveCaptionReader : AccessibilityService() {
                     OverlayService.updateText(text, hindi)
                     MainActivity.instance?.onTranslation(text, hindi, hindi)
                 }
-                // Update gender from source text pronouns (works for all languages)
-                HindiTtsService.updateGenderFromSource(text, serverLang.ifBlank { confirmedLang })
+                // Gender detection is audio-only (GenderAnalyzer.kt) — no pronoun detection
                 HindiTtsService.speak(hindi)
             }
         }
