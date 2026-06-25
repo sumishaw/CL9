@@ -139,8 +139,8 @@ object HindiTtsService {
             Gender.AUTO   -> "auto"   // resolved in fetchWorker to catch late gender switches
         }
 
-        // If fetch queue is backlogged (> 2 items), drop oldest to stay near real-time
-        while (fetchQueue.size >= 2) fetchQueue.poll()
+        // FIFO: never drop sentences — every sentence gets spoken in order
+        // fetchQueue is unbounded LinkedBlockingQueue so memory is safe
         fetchQueue.offer(FetchItem(n, genderTag, speed, srcText))
     }
 
@@ -201,10 +201,12 @@ object HindiTtsService {
                     // No audio focus request — USAGE_ASSISTANT handles exclusion from LC
                     // AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE was pausing video → LC gap → loop
                     withContext(Dispatchers.Main) {
+                        // Sync subtitle to exactly what is being spoken (FIFO display)
                         OverlayService.showTtsText(item.text)
                     }
                     playWav(item.wav, item.durMs)
                     withContext(Dispatchers.Main) {
+                        // TTS finished — advance subtitle to next queued item
                         OverlayService.clearTtsText()
                     }
                     speakingUntilMs = System.currentTimeMillis() + 300L
