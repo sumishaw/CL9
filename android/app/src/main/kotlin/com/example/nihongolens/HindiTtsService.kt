@@ -58,7 +58,7 @@ object HindiTtsService {
     private var focusRequest: android.media.AudioFocusRequest? = null
 
     // ── FIFO queues (unbounded — never drop sentences) ────────────────────────
-    data class FetchItem(val text: String, val gender: String, val speed: Float)
+    data class FetchItem(val text: String, val gender: String, val speed: Float, val srcText: String = "")
     data class PlayItem (val text: String, val wav: ByteArray, val durMs: Long)
 
     private val fetchQueue = LinkedBlockingQueue<FetchItem>()
@@ -121,7 +121,7 @@ object HindiTtsService {
 
     // ── Speak ─────────────────────────────────────────────────────────────────
 
-    fun speak(hindi: String) {
+    fun speak(hindi: String, srcText: String = "") {
         if (!enabled || hindi.isBlank()) return
         val n = hindi.trim().replace(Regex("\\s+"), " ")
 
@@ -141,7 +141,7 @@ object HindiTtsService {
 
         // If fetch queue is backlogged (> 2 items), drop oldest to stay near real-time
         while (fetchQueue.size >= 2) fetchQueue.poll()
-        fetchQueue.offer(FetchItem(n, genderTag, speed))
+        fetchQueue.offer(FetchItem(n, genderTag, speed, srcText))
     }
 
 
@@ -157,10 +157,24 @@ object HindiTtsService {
                 if (!enabled) continue
                 try {
                     // Resolve gender at fetch time — captures latest GenderAnalyzer result
+                    // ONLY GenderAnalyzer (audio pitch) sets detectedGender.
+                    // Pronouns in source text NEVER change the voice — only verb forms.
                     val resolvedGender = if (item.gender == "auto")
                         if (detectedGender == Gender.FEMALE) "female" else "male"
                     else item.gender
-                    val wav = fetchWav(item.text, resolvedGender, item.speed)
+
+                    // Verb form gender: audio gender takes priority.
+                    // If audio says male but text has "she/her" → still use male voice
+                    // but DO apply feminine verb conjugation for accuracy.
+                    val verbGender = when {
+                        resolvedGender == "female" -> "female"           // audio says female
+                        hasFemininePronouns(item.srcText) -> "female"    // text hint only → verbs
+                        else -> "male"
+                    }
+                    val textToSpeak = if (verbGender == "female")
+                        toFeminineHindi(item.text) else item.text
+
+                    val wav = fetchWav(textToSpeak, resolvedGender, item.speed)
                     if (wav != null && wav.size > 44) {
                         val sr  = readInt(wav, 24).coerceAtLeast(8_000)
                         val nch = readShort(wav, 22).coerceAtLeast(1)
@@ -287,6 +301,81 @@ object HindiTtsService {
             am?.abandonAudioFocusRequest(req)
         }
         focusRequest = null
+    }
+
+
+    // ── Pronoun hint (verb forms only — does NOT affect voice switching) ──────
+    //
+    // Checks English source text for feminine pronouns.
+    // Result is used ONLY for Hindi verb conjugation, never for voice selection.
+    // Voice (male/female) is controlled exclusively by GenderAnalyzer audio pitch.
+
+    private fun hasFemininePronouns(src: String): Boolean {
+        if (src.isBlank()) return false
+        val t = " ${src.lowercase()} "
+        return t.contains(" she ") || t.contains(" her ") ||
+               t.contains(" herself ") || t.contains(" she's ") ||
+               t.contains(" she'd ") || t.contains(" she'll ")
+    }
+
+    // ── Feminine Hindi verb form conversion ──────────────────────────────────
+    //
+    // Converts masculine verb endings to feminine in Hindi text.
+    // Applied when: (a) audio detects female voice, OR (b) source text has she/her pronouns.
+    // Covers ि / ी / े / ैं suffix patterns in common verb+auxiliary combinations.
+
+    private fun toFeminineHindi(text: String): String {
+        var t = text
+
+        // ── First person present ──────────────────────────────────────────────
+        t = t.replace("ता हूँ", "ती हूँ")
+        t = t.replace("ता हूं", "ती हूं")
+        t = t.replace("रहा हूँ", "रही हूँ")
+        t = t.replace("रहा हूं", "रही हूं")
+        t = t.replace("सकता हूँ", "सकती हूँ")
+        t = t.replace("सकता हूं", "सकती हूं")
+        t = t.replace("चाहता हूँ", "चाहती हूँ")
+        t = t.replace("चाहता हूं", "चाहती हूं")
+
+        // ── Third person present ──────────────────────────────────────────────
+        t = t.replace("ता है", "ती है")
+        t = t.replace("रहा है", "रही है")
+        t = t.replace("ता हैं", "ती हैं")
+        t = t.replace("रहे हैं", "रही हैं")
+        t = t.replace("सकता है", "सकती है")
+        t = t.replace("चाहता है", "चाहती है")
+        t = t.replace("लगता है", "लगती है")
+        t = t.replace("होता है", "होती है")
+        t = t.replace("मिलता है", "मिलती है")
+
+        // ── Past tense ────────────────────────────────────────────────────────
+        t = t.replace("ता था", "ती थी")
+        t = t.replace("ते थे", "ती थीं")
+        t = t.replace("रहा था", "रही थी")
+        t = t.replace("सकता था", "सकती थी")
+        t = t.replace("लगता था", "लगती थी")
+        t = t.replace("होता था", "होती थी")
+        t = t.replace("चाहता था", "चाहती थी")
+
+        // ── Past participle ───────────────────────────────────────────────────
+        t = t.replace("गया", "गई")
+        t = t.replace("गए", "गईं")
+        t = t.replace("आया", "आई")
+        t = t.replace("आए", "आईं")
+        t = t.replace("किया", "की")
+        t = t.replace("लिया", "ली")
+        t = t.replace("दिया", "दी")
+        t = t.replace("पाया", "पाई")
+        t = t.replace("पाए", "पाईं")
+        t = t.replace("बताया", "बताई")
+        t = t.replace("सुनाया", "सुनाई")
+        t = t.replace("बनाया", "बनाई")
+
+        // ── Continuous ────────────────────────────────────────────────────────
+        t = t.replace("रहा हूँ", "रही हूँ")  // (already above, idempotent)
+        t = t.replace("रहा हूं", "रही हूं")
+
+        return t
     }
 
     // ── Gender poller ─────────────────────────────────────────────────────────
