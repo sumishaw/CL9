@@ -107,9 +107,9 @@ class MainActivity : FlutterActivity() {
                     val i = Intent(this, OverlayService::class.java)
                     startForegroundServiceCompat(i)
                     result.success(true)
-                    // Request MediaProjection via proper FGS flow for GenderAnalyzer
-                    // Must use SpeechCaptureService (has foregroundServiceType=mediaProjection)
-                    mainHandler.post { requestProjectionForGender() }
+                    // GenderAnalyzer uses Visualizer API — no MediaProjection needed
+                    // Start immediately after overlay starts
+                    mainHandler.post { GenderAnalyzer.start() }
                 }
 
                 "stopOverlay" -> {
@@ -297,8 +297,8 @@ class MainActivity : FlutterActivity() {
     fun onLiveCaptionReaderConnected() {
         mainHandler.post {
             methodChannel?.invokeMethod("onLiveCaptionReaderConnected", null)
-            // Projection for GenderAnalyzer is requested from startOverlay (user-triggered)
-            // NOT here — calling startActivityForResult during app restore crashes the app
+            // Start GenderAnalyzer using Visualizer API — no projection needed, safe to call anytime
+            if (!GenderAnalyzer.enabled) GenderAnalyzer.start()
         }
     }
 
@@ -381,46 +381,19 @@ class MainActivity : FlutterActivity() {
             pendingProjectionResult = null
 
             if (resultCode == Activity.RESULT_OK && data != null) {
-                val genderOnly = pendingGenderOnly
-                pendingGenderOnly = false
-
                 val i = Intent(this, SpeechCaptureService::class.java).apply {
                     putExtra(SpeechCaptureService.EXTRA_RESULT_CODE, resultCode)
                     putExtra(SpeechCaptureService.EXTRA_RESULT_DATA, data)
-                    if (genderOnly) putExtra(SpeechCaptureService.EXTRA_GENDER_ONLY, true)
                 }
                 startForegroundServiceCompat(i)
-                if (!genderOnly) pending?.success(true)
-                else CaptionLogger.log("MainActivity", "Gender-only SCS started")
+                pending?.success(true)
             } else {
-                pendingGenderOnly = false
                 pending?.success(false)
             }
         }
     }
 
-    // ── Gender-only projection (LC mode) ─────────────────────────────────────
-
-    // Pending flag: when REQ_MEDIA_PROJECTION completes in gender-only mode,
-    // start SpeechCaptureService with EXTRA_GENDER_ONLY=true instead of normal capture
-    @Volatile private var pendingGenderOnly = false
-
-    private fun requestProjectionForGender() {
-        if (SpeechCaptureService.isRunning) {
-            // Audio capture already running — GenderAnalyzer already has projection
-            CaptionLogger.log("MainActivity", "requestProjectionForGender: SCS already running")
-            return
-        }
-        if (!Settings.canDrawOverlays(this)) return
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) return   // ask later via startSpeechCapture
-        pendingGenderOnly = true
-        requestMediaProjection(object : MethodChannel.Result {
-            override fun success(r: Any?) {}
-            override fun error(c: String, m: String?, d: Any?) {}
-            override fun notImplemented() {}
-        })
-    }
+    // requestProjectionForGender() removed — GenderAnalyzer uses Visualizer API, no projection needed
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
