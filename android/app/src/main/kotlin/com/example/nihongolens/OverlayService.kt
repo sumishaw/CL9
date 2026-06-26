@@ -49,9 +49,9 @@ class OverlayService : Service() {
 
         fun updateText(original: String, hindi: String) {
             latestOriginal = original; latestHindi = hindi
-            // Always update subtitle immediately when translation arrives
-            // TTS plays asynchronously — subtitle and TTS run in parallel
-            instance?.handler?.post { instance?.onNewHindi(hindi) }
+            // Add to FIFO backlog only — subtitle displayed when TTS speaks it
+            // This keeps subtitle in sync with audio (no ahead-of-TTS display)
+            instance?.handler?.post { instance?.enqueueHindi(hindi) }
         }
 
         // Called by TTS play worker when it STARTS speaking a sentence.
@@ -141,20 +141,26 @@ class OverlayService : Service() {
     private fun onNewHindi(hindi: String) {
         if (hindi.isBlank()) return
         val token = tokenCounter.incrementAndGet()
-
         if (holdMs == 0L) {
-            // Live mode: show immediately, replace whatever is showing
-            cancelTimers()
-            active = false
-            backlog.clear()
-            backlog.offer(Item(token, hindi.trim()))
-            advance()
+            cancelTimers(); active = false; backlog.clear()
+            backlog.offer(Item(token, hindi.trim())); advance()
         } else {
-            // Timed mode: queue and advance when ready
             backlog.offer(Item(token, hindi.trim()))
             if (!active) advance()
         }
         reschedSilence()
+    }
+
+    /**
+     * Silently adds hindi text to the FIFO backlog without displaying it.
+     * Subtitle will appear only when TTS starts speaking (showTtsText).
+     * This keeps subtitle perfectly in sync with audio — no ahead-of-TTS display.
+     */
+    private fun enqueueHindi(hindi: String) {
+        if (hindi.isBlank()) return
+        val token = tokenCounter.incrementAndGet()
+        backlog.offer(Item(token, hindi.trim()))
+        // Do NOT call advance() here — TTS worker drives display via showTtsText()
     }
 
     private fun onClear() {
