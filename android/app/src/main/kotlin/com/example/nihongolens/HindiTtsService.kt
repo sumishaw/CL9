@@ -107,7 +107,7 @@ object HindiTtsService {
     private val playQueue  = LinkedBlockingQueue<PlayItem>()
 
     // Token dedup — never re-speak same sentence
-    @JvmField val spokenTokens = java.util.concurrent.ConcurrentHashMap<Int, Boolean>()  // accessible from GenderAnalyzer
+    @JvmField val spokenTokens = java.util.concurrent.ConcurrentHashMap<Int, Long>()  // token → timestamp, 10s window
 
     private var fetchWorker: Job? = null
     private var playWorker:  Job? = null
@@ -169,7 +169,10 @@ object HindiTtsService {
         val n = hindi.trim().replace(Regex("\\s+"), " ")
 
         val token = n.hashCode()
-        if (spokenTokens.putIfAbsent(token, true) != null) return
+        val now = System.currentTimeMillis()
+        val lastSpoken = spokenTokens[token]
+        if (lastSpoken != null && now - lastSpoken < 10_000L) return  // same sentence within 10s → skip
+        spokenTokens[token] = now   // record when spoken
         if (spokenTokens.size > 300) spokenTokens.clear()
 
         // Use acoustic emotion (from GenderAnalyzer) — fall back to text
