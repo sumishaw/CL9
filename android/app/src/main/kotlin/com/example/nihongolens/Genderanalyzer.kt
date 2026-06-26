@@ -73,9 +73,11 @@ object GenderAnalyzer {
     private var bufIdx         = 0
 
     // Tracking state
-    private var prevF0         = 0f
-    private val f0Ring         = FloatArray(8)   // recent F0 values for jitter
-    private var f0RingIdx      = 0
+    private var prevF0          = 0f
+    private val f0Ring          = FloatArray(8)   // recent F0 values for jitter
+    private var f0RingIdx       = 0
+    private var sustainedFrames = 0    // consecutive stable-F0 frames (singing detection)
+    private var lastStableF0    = 0f   // F0 of current sustained note
     private var maleF0Base   = 0f    // male F0 baseline (85–164Hz range)
     private var femaleF0Base = 0f    // female F0 baseline (165–400Hz range)
     private var frameCount     = 0
@@ -295,7 +297,8 @@ ingest(buf, n)
         f0Ring[f0RingIdx % f0Ring.size] = f0; f0RingIdx++
 
         // Sustained note detection: count frames where F0 stays within ±5%
-        if (lastStableF0 > 0f && abs(f0 - lastStableF0) / lastStableF0 < 0.05f) {
+        val f0Diff = if (lastStableF0 > 0f) kotlin.math.abs(f0 - lastStableF0) / lastStableF0 else 1f
+        if (f0Diff < 0.05f) {
             sustainedFrames++
         } else {
             sustainedFrames = 0
