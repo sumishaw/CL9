@@ -263,8 +263,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         // Count skipped/translated from logs
         int skip = 0, trans = 0;
         for (final l in lines) {
-          if (l.contains('SKIP')) skip++;
-          if (l.contains('[tts]') || l.contains('OK ')) trans++;
+          if (l.contains('[LCReader] SKIP')) skip++;
+          if (l.contains('[HindiTTS]') || l.contains('[tts]')) trans++;
         }
         final gst = await _ch.invokeMethod<Map>('getGenderStatus');
         if (!mounted) return;
