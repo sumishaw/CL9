@@ -422,9 +422,12 @@ class LiveCaptionReader : AccessibilityService() {
         // These cause fast ERR responses from whisper_server
         val stripped = text.trim().removeSurrounding("(", ")")
             .removeSurrounding("[", "]").trim()
-        if (text.trim().matches(Regex("^[\[(].*[\])]$")) ||
+        val trimmed = text.trim()
+        val isAnnotation = (trimmed.startsWith("(") && trimmed.endsWith(")")) ||
+                           (trimmed.startsWith("[") && trimmed.endsWith("]"))
+        if (isAnnotation ||
             stripped.lowercase() in setOf("music", "singing", "applause",
-                "laughter", "cheering", "instrumental", "song", "♪", "🎵")) {
+                "laughter", "cheering", "instrumental", "song")) {
             CaptionLogger.log(TAG, "SKIP music annotation: $text")
             return
         }
