@@ -28,10 +28,13 @@ object GenderAnalyzer {
     private const val TAG          = "GenderAnalyzer"
     private const val SR           = 16_000
     private const val WIN          = 2048        // 128ms window
-    private const val F0_FEMALE    = 165f        // Hz — above = female
-    private const val YIN_THRESH   = 0.22f   // stricter — rejects music/noise better
+    // Voice frequency range (Hz)
+    private const val F0_VOICE_MIN  = 85f    // below = music bass/drums, not voice
+    private const val F0_FEMALE_MIN = 165f   // male: 85-164Hz, female: 165-400Hz
+    private const val F0_VOICE_MAX  = 400f   // above = falsetto/noise, not natural speech
+    private const val YIN_THRESH    = 0.22f  // stricter — rejects music/noise better
     private const val RMS_FLOOR    = 80f         // out of 32768 — skip silence
-    private const val HIST         = 6   // needs 4/6 majority — prevents music-induced flicker
+    private const val HIST         = 3           // 2/3 majority to switch
 
     @Volatile var enabled    = false
     @Volatile var lastStatus = "waiting for screen capture permission"
@@ -235,8 +238,15 @@ object GenderAnalyzer {
 
     private fun onPitch(f0: Float, rms: Float) {
         frameCount++
-        val gender = if (f0 >= F0_FEMALE) HindiTtsService.Gender.FEMALE
-                     else                  HindiTtsService.Gender.MALE
+        // Ignore frequencies outside natural human voice range
+        // Sub-85Hz = music bass/drums, above 400Hz = noise/harmonics
+        if (f0 < F0_VOICE_MIN || f0 > F0_VOICE_MAX) {
+            if (frameCount % 10 == 0)
+                CaptionLogger.log(TAG, "IGNORE F0=${f0.toInt()}Hz — outside voice range ${F0_VOICE_MIN.toInt()}-${F0_VOICE_MAX.toInt()}Hz")
+            return
+        }
+        val gender = if (f0 >= F0_FEMALE_MIN) HindiTtsService.Gender.FEMALE
+                     else                      HindiTtsService.Gender.MALE
 
         if (frameCount % 5 == 0)
             CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} → $gender")
