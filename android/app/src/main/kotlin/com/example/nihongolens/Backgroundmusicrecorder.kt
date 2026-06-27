@@ -45,6 +45,21 @@ object BackgroundMusicRecorder {
     // Current background sequence number — snapshot this at sentence enqueue time
     val currentSeq = AtomicInteger(0)
 
+    // FIX BUG 2: Local indexed chunk store for Android-side BG mixing.
+    // HindiTtsService.mixBgMusic() reads from here — no server round-trip needed.
+    // Key=seq, Value=raw int16 PCM bytes (44100Hz stereo)
+    private val chunkStore   = ConcurrentHashMap<Int, ByteArray>()
+    private val chunkSeqList = ArrayDeque<Int>()
+    private val chunkLock    = Any()
+
+    fun getChunk(seq: Int): ByteArray? {
+        // Try exact seq first, then nearby (±3 = ±6s tolerance)
+        return chunkStore[seq]
+            ?: chunkStore[seq - 1] ?: chunkStore[seq + 1]
+            ?: chunkStore[seq - 2] ?: chunkStore[seq + 2]
+            ?: chunkStore[seq - 3] ?: chunkStore[seq + 3]
+    }
+
     private val scope       = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var captureJob: Job? = null
     private var captureRec: AudioRecord? = null
@@ -127,12 +142,19 @@ object BackgroundMusicRecorder {
                     val rms = calcRms(pcmBytes)
                     if (rms > SILENCE_RMS) {
                         val seq = currentSeq.incrementAndGet()
-                        // POST chunk to server asynchronously
+                        // Store locally for Android-side mixing (HindiTtsService.mixBgMusic)
+                        synchronized(chunkLock) {
+                            chunkStore[seq] = pcmBytes
+                            chunkSeqList.addLast(seq)
+                            if (chunkSeqList.size > MAX_STORED) {
+                                chunkStore.remove(chunkSeqList.removeFirst())
+                            }
+                        }
+                        // Also POST to server for server-side mixing fallback
                         launch(Dispatchers.IO) {
                             sendChunk(seq, pcmBytes)
                         }
                     } else {
-                        // Silent — advance seq so timing stays aligned but don't POST
                         currentSeq.incrementAndGet()
                     }
                 }
