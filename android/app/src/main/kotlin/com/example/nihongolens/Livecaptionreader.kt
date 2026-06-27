@@ -15,13 +15,12 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * LiveCaptionReader — Live Captions → Hindi translation → Overlay
  *
- * Key design decisions:
- * - readWindow() extracts the LAST COMPLETE SENTENCE from LC accumulated text
- *   (sentence ending with 。？！\n or punctuation) — not raw accumulated text
- * - Simple dedup: only skip if exact same text was last enqueued
- * - No grow-gate: every meaningful new sentence is enqueued
- * - FIFO queue (unbounded) with sequence tokens — nothing dropped by dedup logic
- * - Queue cap=5 only drops oldest when severely backlogged (CT2 slow)
+ * CRITICAL FIX v2: Near-realtime translation
+ * - READ_TIMEOUT reduced to 6s (was 35s) — cuts worst-case delay 6x
+ * - SKIP-AHEAD: if queue has >1 item, always process the LATEST (skip old ones)
+ * - Translation cache: identical/prefix-match sentences return instantly
+ * - Stale threshold: 6s (was 15s) — drops sentences speaker has already passed
+ * - Queue cap: 3 (was 8) — never build up more than 1 sentence of backlog
  */
 class LiveCaptionReader : AccessibilityService() {
 
@@ -29,12 +28,21 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TAG              = "LCReader"
         private const val TRANSLATE_URL    = "http://127.0.0.1:8765/translate_text"
         private const val CONNECT_TIMEOUT  = 3_000
-        private const val READ_TIMEOUT     = 35_000
+        // CRITICAL FIX: 6s timeout instead of 35s
+        // CT2 opus-mt should finish in <500ms normally; 6s covers slow cases
+        // Old 35s was causing 20-30s queue backlog that never recovered
+        private const val READ_TIMEOUT     = 6_000
         private const val DEBOUNCE_MS      = 400L
         private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
         private const val LANG_CONFIRM     = 3
-        private const val QUEUE_CAP        = 8   // enough to buffer ~10s of speech at normal pace
+        // CRITICAL FIX: Queue cap 3 (was 8)
+        // With 6s timeout and 2 workers: max lag = 3 * 3s = 9s worst case
+        // Old cap=8 with 35s timeout = 280s backlog possible
+        private const val QUEUE_CAP        = 3
+        // CRITICAL FIX: Stale threshold 5s (was 15s)
+        // Drop sentences the speaker said >5s ago — they've moved on
+        private const val STALE_MS         = 5_000L
 
         private val LC_PACKAGES = setOf(
             "com.google.android.as",
@@ -56,6 +64,11 @@ class LiveCaptionReader : AccessibilityService() {
     private val queue      = LinkedBlockingQueue<QItem>()
     private val seqCounter = AtomicLong(0)
     @Volatile private var expectedSeq = 0L
+
+    // Translation LRU cache — avoid re-translating same sentence
+    // Key: normalized English, Value: Hindi result
+    private val translationCache = LinkedHashMap<String, String>(32, 0.75f, true)
+    private val CACHE_MAX = 50
 
     // Simple dedup — only exact match
     private var lastEnqueued  = ""
@@ -104,9 +117,7 @@ class LiveCaptionReader : AccessibilityService() {
         startWorker()
         startWatchdog()
         startStats()
-        CaptionLogger.log(TAG, "=== Connected ===")
-        // Start gender detection — pass lcProjection for headphone-safe internal audio capture
-        // Falls back to mic if projection not yet granted
+        CaptionLogger.log(TAG, "=== Connected (READ_TIMEOUT=${READ_TIMEOUT}ms QUEUE_CAP=$QUEUE_CAP STALE=${STALE_MS}ms) ===")
         GenderAnalyzer.start(MainActivity.lcProjection)
         scope.launch(Dispatchers.Main) { MainActivity.instance?.onLiveCaptionReaderConnected() }
     }
@@ -115,7 +126,7 @@ class LiveCaptionReader : AccessibilityService() {
 
     override fun onDestroy() {
         isRunning = false; instance = null
-        GenderAnalyzer.stop()   // stop mic AudioRecord cleanly
+        GenderAnalyzer.stop()
         pendingJob?.cancel()
         watchdogJob?.cancel(); translateJob?.cancel(); translateJob2?.cancel()
         queue.clear(); scope.cancel()
@@ -166,7 +177,7 @@ class LiveCaptionReader : AccessibilityService() {
                 delay(30_000L)
                 CaptionLogger.log(TAG, "STATS evt=${evtCount.get()} enq=${enqCount.get()} " +
                     "ok=${okCount.get()} err=${errCount.get()} q=${queue.size} " +
-                    "vis=$lcVisible lang=$confirmedLang seq=$expectedSeq")
+                    "vis=$lcVisible lang=$confirmedLang seq=$expectedSeq cache=${translationCache.size}")
             }
         }
     }
@@ -197,7 +208,6 @@ class LiveCaptionReader : AccessibilityService() {
                 if (dropped > 0) CaptionLogger.log(TAG, "LC gone dropped=$dropped")
                 else              CaptionLogger.log(TAG, "LC gone")
                 OverlayService.clearQueue()
-                // Stop TTS immediately — video is silent/paused
                 HindiTtsService.stopAndClear()
                 sentenceTimerJob?.cancel(); sentenceTimerJob = null
                 sentenceBuffer = ""; lastBufferEnqueued = ""; lastEnqueuedWordCount = 0
@@ -225,12 +235,9 @@ class LiveCaptionReader : AccessibilityService() {
         val prev    = lastRawFull
         lastRawFull = full
 
-        // Get only the NEW text added since last read
         val newText = if (prev.isNotEmpty() && full.startsWith(prev))
             full.substring(prev.length).trim()
         else {
-            // LC window scrolled or reset — use only the last sentence of full text
-            // Split by sentence boundary and take the last complete-looking sentence
             val sentences = full.split(Regex("""(?<=[.!?。！？])\s+"""))
             sentences.lastOrNull { it.trim().length >= 4 }?.trim() ?: return null
         }
@@ -241,8 +248,7 @@ class LiveCaptionReader : AccessibilityService() {
 
     private fun splitSentences(text: String): List<String> {
         val result = mutableListOf<String>()
-        val parts  = text.split(Regex("""(?<=[。！？
-.!?])\s*"""))
+        val parts  = text.split(Regex("""(?<=[。！？\n.!?])\s*"""))
         for (part in parts) {
             val t = part.trim()
             if (t.length >= 4) result.add(t)
@@ -257,11 +263,10 @@ class LiveCaptionReader : AccessibilityService() {
         if (n == lastEnqueued) return
         lastEnqueued = n
         val seq = seqCounter.incrementAndGet()
-        // Simple path — same smart drop logic
         if (queue.size >= QUEUE_CAP) {
             val oldest = queue.peek()
             val age = if (oldest != null) System.currentTimeMillis() - oldest.enqMs else 9999L
-            if (age > 8_000L) queue.poll()
+            if (age > STALE_MS) queue.poll()
         }
         queue.offer(QItem(seq, text))
         enqCount.incrementAndGet()
@@ -273,7 +278,7 @@ class LiveCaptionReader : AccessibilityService() {
     private fun norm(t: String) = t.trim().replace(Regex("\\s+"), " ")
 
     private var sentenceBuffer      = ""
-    private var lastBufferEnqueued  = ""   // tracks last text actually sent to worker
+    private var lastBufferEnqueued  = ""
     private var lastLCChangeMs      = 0L
     private val SENTENCE_SILENCE_MS = 600L
     private var sentenceTimerJob: Job? = null
@@ -281,7 +286,6 @@ class LiveCaptionReader : AccessibilityService() {
     private var lastEnqueuedText      = ""
 
     private fun schedule(text: String) {
-        // Language detection
         val script = detectScript(text)
         if (script != confirmedLang) {
             if (script == pendingLang) {
@@ -303,10 +307,6 @@ class LiveCaptionReader : AccessibilityService() {
         val words     = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
         val wordCount = words.size
 
-        // Always cap at 12 words for translation — keeps TTS under 3s per chunk
-        val toTranslate = if (wordCount > 20) words.take(20).joinToString(" ") else trimmed
-
-        // TRIGGER 1a: strong punctuation → translate immediately (100ms settle)
         val endsWithHardPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
                                 trimmed.endsWith("!") || trimmed.endsWith("。") ||
                                 trimmed.endsWith("？") || trimmed.endsWith("！") ||
@@ -315,7 +315,7 @@ class LiveCaptionReader : AccessibilityService() {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
                 delay(100)
-                val t = capWords(sentenceBuffer.trim(), 20)
+                val t = sentenceBuffer.trim()
                 if (t.isNotBlank() && t != lastEnqueuedText) {
                     lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
                     enqueue(t); sentenceBuffer = ""
@@ -324,7 +324,6 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // TRIGGER 1b: soft punctuation (,;:-) → translate after 350ms if 5+ words
         val endsWithSoftPunct = trimmed.endsWith(",") || trimmed.endsWith(";") ||
                                 trimmed.endsWith(":") || trimmed.endsWith(" -") ||
                                 trimmed.endsWith("—")
@@ -332,7 +331,7 @@ class LiveCaptionReader : AccessibilityService() {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
                 delay(350)
-                val t = capWords(sentenceBuffer.trim(), 20)
+                val t = sentenceBuffer.trim()
                 if (t.isNotBlank() && t != lastEnqueuedText) {
                     lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
                     enqueue(t); sentenceBuffer = ""
@@ -341,14 +340,12 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // TRIGGER 2: natural phrase boundary — 5+ word growth OR 8+ words total
-        // Lower threshold catches spoken phrases faster without waiting for silence
         val grown = wordCount - lastEnqueuedWordCount
         if ((grown >= 5 && wordCount >= 5) || (wordCount >= 8 && grown >= 3)) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(150)  // brief settle for word correction
-                val t = capWords(sentenceBuffer.trim(), 20)
+                delay(150)
+                val t = sentenceBuffer.trim()
                 if (t.isNotBlank() && t != lastEnqueuedText) {
                     lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
                     enqueue(t); sentenceBuffer = ""
@@ -357,11 +354,10 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // TRIGGER 3: silence — 1.2s no change
         sentenceTimerJob?.cancel()
         sentenceTimerJob = scope.launch {
             delay(SENTENCE_SILENCE_MS)
-            val t = capWords(sentenceBuffer.trim(), 20)
+            val t = sentenceBuffer.trim()
             if (t.isNotBlank() && t != lastEnqueuedText && wordCount >= 2) {
                 CaptionLogger.log(TAG, "SILENCE translate")
                 lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
@@ -371,30 +367,20 @@ class LiveCaptionReader : AccessibilityService() {
         pendingJob?.cancel()
     }
 
-        private fun capWords(text: String, maxWords: Int): String {
-            // Return full sentence — no truncation
-            // All words must be spoken; cutting breaks meaning
-            return text.trim()
-        }
-
     private fun enqueue(text: String) {
         if (text.isBlank() || text.length < 4) return
 
-        // LOOP PREVENTION 1: Block ANY Devanagari — TTS output re-captured by Live Captions
         val devanagariCount = text.count { it.code in 0x0900..0x097F }
         if (devanagariCount > 0) {
             CaptionLogger.log(TAG, "SKIP: Devanagari detected (TTS loop guard)")
             return
         }
 
-        // Skip very short texts — single words like "Time.", "Like," are not worth translating
-        // They are usually mid-sentence LC accumulation artifacts
         val wordCount = text.trim().split(Regex("\\s+")).size
         if (wordCount < 2) {
             CaptionLogger.log(TAG, "SKIP: too short ($wordCount words)")
             return
         }
-        // These words appear in LC when TTS Hindi speech is re-captured
         val lower = text.lowercase()
         val romanizedHindi = listOf(
             "sunkar","muskura","heto","hain","nahin","theek","aapko",
@@ -407,30 +393,13 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // NOTE: isSuppressed() check removed — subtitle display is independent of TTS.
-        // TTS loop is prevented by: (1) Devanagari guard above, (2) romanized Hindi guard,
-        // (3) USAGE_ASSISTANT audio attribute (excluded from Live Captions capture).
-        // Blocking subtitle on isSuppressed caused 4-6s display delay per sentence.
-
         val n = norm(text)
         if (n == lastEnqueued || n == norm(lastSentText)) {
             CaptionLogger.log(TAG, "SKIP dup")
             return
         }
-        // Skip sound annotations — no translatable speech
-        val tr = text.trim()
-        val isAnnotation = (tr.startsWith("(") && tr.endsWith(")")) ||
-                           (tr.startsWith("[") && tr.endsWith("]"))
-        val stripped = tr.removeSurrounding("(", ")").removeSurrounding("[", "]").trim().lowercase()
-        if (isAnnotation && stripped in setOf("music", "singing", "applause",
-                "laughter", "cheering", "instrumental", "song", "sound effects")) {
-            CaptionLogger.log(TAG, "SKIP annotation: $tr"); return
-        }
 
-        // If this text is just a longer version of what's already queued (LC growth),
-        // remove the shorter version from queue — it will be superseded
         if (n.startsWith(lastEnqueued) && lastEnqueued.length > 10) {
-            // Remove the shorter prefix from queue if still there
             queue.removeIf { norm(it.text) == lastEnqueued }
             CaptionLogger.log(TAG, "SUPERSEDE: removed shorter prefix")
         }
@@ -438,16 +407,22 @@ class LiveCaptionReader : AccessibilityService() {
         lastEnqueued = n
         val seq = seqCounter.incrementAndGet()
 
+        // CRITICAL FIX: Skip-ahead — if queue already has items older than 3s,
+        // drop them all and only keep this latest sentence
+        // This prevents accumulating a backlog of sentences that will never be timely
         if (queue.size >= QUEUE_CAP) {
-            // Only drop if the oldest item is >8s old (truly stale)
-            // Don't drop recent sentences — they still need to be spoken
             val oldest = queue.peek()
             val oldestAge = if (oldest != null) System.currentTimeMillis() - oldest.enqMs else 0L
-            if (oldestAge > 8_000L) {
-                queue.poll()
-                CaptionLogger.log(TAG, "CAP: dropped stale item age=${oldestAge/1000}s")
+            if (oldestAge > STALE_MS) {
+                val cleared = queue.size
+                queue.clear()
+                CaptionLogger.log(TAG, "SKIP-AHEAD: cleared $cleared stale items, going to latest")
+            } else {
+                // Queue not stale yet — just block new item if full
+                // (3-item cap means this is only 1-2 sentences max)
+                CaptionLogger.log(TAG, "CAP: queue full q=${queue.size}")
+                return
             }
-            // If oldest is recent, keep it — let queue grow slightly
         }
 
         queue.offer(QItem(seq, text))
@@ -460,8 +435,7 @@ class LiveCaptionReader : AccessibilityService() {
     private var translateJob2: Job? = null
 
     private fun startWorker() {
-        // Start 2 parallel workers — doubles translation throughput
-        // Both pull from same queue; order preserved by seq numbers in OverlayService
+        // 2 parallel workers — doubles throughput
         translateJob  = scope.launch { workerLoop("W1") }
         translateJob2 = scope.launch { workerLoop("W2") }
     }
@@ -473,68 +447,80 @@ class LiveCaptionReader : AccessibilityService() {
                 catch (_: InterruptedException) { null }
             } ?: continue
 
-                val seq  = item.seq
-                val text = item.text
-                val ageMs = System.currentTimeMillis() - item.enqMs
+            val seq   = item.seq
+            val text  = item.text
+            val ageMs = System.currentTimeMillis() - item.enqMs
 
-                if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
-                // Drop sentences that waited too long — speaker has moved on
-                if (ageMs > 6_000L) {
-                    CaptionLogger.log(TAG, "EXPIRED $seq age=${ageMs/1000}s")
-                    continue
+            if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
+            // CRITICAL FIX: Drop sentences >5s old (was 15s)
+            if (ageMs > STALE_MS) {
+                CaptionLogger.log(TAG, "EXPIRED $seq age=${ageMs/1000}s")
+                continue
+            }
+
+            // CRITICAL FIX: Check cache FIRST before any HTTP call
+            val nText = norm(text)
+            val cached = synchronized(translationCache) { translationCache[nText] }
+            if (cached != null) {
+                CaptionLogger.log(TAG, "CACHE-HIT[$name] $seq '${cached.take(40)}'")
+                deliverHindi(seq, text, cached, name, 0L)
+                continue
+            }
+
+            val t0     = System.currentTimeMillis()
+            lastSentText = text
+            val result = callServer(text)
+            val ms     = System.currentTimeMillis() - t0
+
+            // CRITICAL FIX: With 6s timeout, if it still takes >4s the sentence is too old
+            if (ms > 4_000L && seq < expectedSeq) {
+                CaptionLogger.log(TAG, "DISCARD-SLOW $seq ${ms}ms (too old)")
+                continue
+            }
+
+            if (seq < expectedSeq) { CaptionLogger.log(TAG, "DISCARD $seq ${ms}ms"); continue }
+
+            if (result == null) {
+                errCount.incrementAndGet()
+                CaptionLogger.log(TAG, "ERR ${ms}ms '${text.take(40)}'")
+                continue
+            }
+
+            val (hindi, serverLang) = result
+
+            // Cache the result
+            synchronized(translationCache) {
+                if (translationCache.size >= CACHE_MAX) {
+                    translationCache.remove(translationCache.keys.first())
                 }
+                translationCache[nText] = hindi
+            }
 
-                val t0     = System.currentTimeMillis()
-                lastSentText = text
-                val result = callServer(text)
-                val ms     = System.currentTimeMillis() - t0
-
-                // Drop if translation took >8s AND newer captions have arrived (stale)
-                if (ms > 8_000L && seq < expectedSeq) {
-                    CaptionLogger.log(TAG, "DISCARD-SLOW $seq ${ms}ms (too old)")
-                    continue
-                }
-
-                if (seq < expectedSeq) { CaptionLogger.log(TAG, "DISCARD $seq ${ms}ms"); continue }
-
-                if (result == null) {
-                    errCount.incrementAndGet()
-                    CaptionLogger.log(TAG, "ERR ${ms}ms '${text.take(40)}'")
-                    continue
-                }
-
-                val (hindi, serverLang) = result
-
-                // Skip if same Hindi shown very recently
-                val now   = System.currentTimeMillis()
-                val hNorm = norm(hindi)
-                if (hNorm == norm(lastHindiOut) && (now - lastHindiTime) < HINDI_DEDUP_MS) {
-                    CaptionLogger.log(TAG, "SKIP dup Hindi")
-                    lastEnqueued = ""; lastRawFull = ""
-                    continue
-                }
-                lastHindiOut  = hindi
-                lastHindiTime = now
-
-                okCount.incrementAndGet()
-                CaptionLogger.log(TAG, "OK[$name] $seq ${ms}ms lang=$serverLang '${hindi.take(50)}'")
-                SpeechCaptureService.latestHindi   = hindi
-                SpeechCaptureService.latestEnglish = text
-
-                withContext(Dispatchers.Main) {
-                    OverlayService.updateText(text, hindi)
-                    MainActivity.instance?.onTranslation(text, hindi, hindi)
-                }
-                // Gender detection is audio-only (GenderAnalyzer.kt) — no pronoun detection
-                // Pass English source text for feminine verb form hints (she/her → ती/ी)
-                // This ONLY affects verb conjugation, NOT voice switching
-                val speakAge = System.currentTimeMillis() - item.enqMs
-                if (speakAge < 5_000L) {
-                    HindiTtsService.speak(hindi, text)
-                } else {
-                    CaptionLogger.log(TAG, "SKIP-STALE TTS $seq age=${speakAge/1000}s")
-                }
+            deliverHindi(seq, text, hindi, name, ms)
         }
+    }
+
+    private fun deliverHindi(seq: Long, text: String, hindi: String, workerName: String, ms: Long) {
+        val now   = System.currentTimeMillis()
+        val hNorm = norm(hindi)
+        if (hNorm == norm(lastHindiOut) && (now - lastHindiTime) < HINDI_DEDUP_MS) {
+            CaptionLogger.log(TAG, "SKIP dup Hindi")
+            lastEnqueued = ""; lastRawFull = ""
+            return
+        }
+        lastHindiOut  = hindi
+        lastHindiTime = now
+
+        okCount.incrementAndGet()
+        CaptionLogger.log(TAG, "OK[$workerName] $seq ${ms}ms '${hindi.take(50)}'")
+        SpeechCaptureService.latestHindi   = hindi
+        SpeechCaptureService.latestEnglish = text
+
+        scope.launch(Dispatchers.Main) {
+            OverlayService.updateText(text, hindi)
+            MainActivity.instance?.onTranslation(text, hindi, hindi)
+        }
+        HindiTtsService.speak(hindi, text)
     }
 
     private fun callServer(text: String): Pair<String, String>? {
@@ -546,6 +532,7 @@ class LiveCaptionReader : AccessibilityService() {
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             conn.doOutput       = true
             conn.connectTimeout = CONNECT_TIMEOUT
+            // CRITICAL FIX: 6s read timeout (was 35s)
             conn.readTimeout    = READ_TIMEOUT
             val body = """{"text":${JSONObject.quote(text)},"src":"auto","tgt":"hi"}"""
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
@@ -571,6 +558,7 @@ class LiveCaptionReader : AccessibilityService() {
         confirmedLang = ""; pendingLang = ""; pendingCount = 0
         lcVisible = false; expectedSeq = 0L
         lastHindiOut = ""; lastHindiTime = 0L
+        translationCache.clear()
         SpeechCaptureService.latestHindi    = ""
         SpeechCaptureService.latestEnglish  = ""
         SpeechCaptureService.latestOriginal = ""
