@@ -199,7 +199,7 @@ object HindiTtsService {
     }
 
     fun destroy() {
-        fetchWorker?.cancel(); playWorker?.cancel()
+        fetchWorker?.cancel(); fetchWorker2?.cancel(); playWorker?.cancel()
         fetchQueue.clear(); playQueue.clear()
         stopAudio()
         tts?.stop(); tts?.shutdown(); tts = null
@@ -251,61 +251,49 @@ object HindiTtsService {
 
     // ── Fetch worker: Android TTS → WAV file ──────────────────────────────────
 
+    private var fetchWorker2: Job? = null   // second fetch worker for parallel pre-synthesis
+
     private fun startFetchWorker() {
-        fetchWorker = scope.launch {
-            while (isActive) {
-                val item = fetchQueue.take()
-                if (!enabled || !ttsReady) continue
+        // TWO parallel fetch workers: while F1 synthesizes sentence N,
+        // F2 starts synthesizing sentence N+1 → near-zero gap between sentences.
+        fetchWorker  = scope.launch { fetchLoop("F1") }
+        fetchWorker2 = scope.launch { fetchLoop("F2") }
+    }
 
-                // Stale guard: 10s
-                val ageMs = System.currentTimeMillis() - item.enqMs
-                if (ageMs > 10_000L) {
-                    CaptionLogger.log(TAG, "TTS-SKIP stale ${ageMs/1000}s '${item.text.take(30)}'")
-                    continue
-                }
-                // Overload guard: max 2 queued
-                if (fetchQueue.size > 2) {
-                    CaptionLogger.log(TAG, "TTS-SKIP overloaded q=${fetchQueue.size+1}")
-                    continue
-                }
+    private suspend fun fetchLoop(workerName: String) {
+        while (isActive) {
+            val item = fetchQueue.take()
+            if (!enabled || !ttsReady) continue
 
-                val t0 = System.currentTimeMillis()
-
-                // FIX BUG 2: Apply feminine Hindi verb/adjective/adverb conversion
-                // ALWAYS for female voice — not just when English pronouns found.
-                // The original speaker is detected as female by GenderAnalyzer (F0 pitch).
-                // So ALL her speech should use feminine Hindi grammar forms.
-                // toFeminineHindi() replaces था→थी, ता है→ती है, गया→गई, etc.
-                val textToSpeak = if (item.gender == "female")
-                    toFeminineHindi(item.text)
-                else
-                    item.text
-
-                if (textToSpeak != item.text)
-                    CaptionLogger.log(TAG, "FEM-CONV '${item.text.take(30)}' → '${textToSpeak.take(30)}'")
-
-                val spokenItem = item.copy(text = textToSpeak)
-                val wavFile = synthesizeToFile(spokenItem) ?: continue
-                val ms = System.currentTimeMillis() - t0
-
-                // Estimate duration from WAV file size
-                val fileSize = wavFile.length()
-                val sr = 22050L  // Android TTS default sample rate
-                val durMs = if (fileSize > 44) ((fileSize - 44) * 1000L) / (sr * 2L) else 2000L
-
-                // FIX BUG 2: Mix background music into TTS WAV at Android side.
-                // BackgroundMusicRecorder captured the bg chunk at sentence enqueue time (bgSeq).
-                // mixBgMusic() retrieves that chunk and mixes it under speech at 28% volume.
-                // This is done here (not server) because Android TTS bypasses /tts endpoint.
-                val mixedFile = mixBgMusic(wavFile, item.bgSeq) ?: wavFile
-
-                CaptionLogger.log(TAG, "TTS-WAV ${ms}ms ${durMs}ms bg=${item.bgSeq} '${textToSpeak.take(40)}'")
-                playQueue.offer(PlayItem(textToSpeak, mixedFile, durMs))
+            val ageMs = System.currentTimeMillis() - item.enqMs
+            if (ageMs > 10_000L) {
+                CaptionLogger.log(TAG, "TTS-SKIP stale ${ageMs/1000}s '${item.text.take(30)}'")
+                continue
             }
+            if (fetchQueue.size > 2) {
+                CaptionLogger.log(TAG, "TTS-SKIP overloaded q=${fetchQueue.size+1}")
+                continue
+            }
+
+            val t0 = System.currentTimeMillis()
+            val textToSpeak = if (item.gender == "female") toFeminineHindi(item.text) else item.text
+            if (textToSpeak != item.text)
+                CaptionLogger.log(TAG, "FEM-CONV '${item.text.take(30)}' → '${textToSpeak.take(30)}'")
+
+            val spokenItem = item.copy(text = textToSpeak)
+            val wavFile = synthesizeToFile(spokenItem) ?: continue
+            val ms = System.currentTimeMillis() - t0
+
+            val fileSize = wavFile.length()
+            val sr = 22050L
+            val durMs = if (fileSize > 44) ((fileSize - 44) * 1000L) / (sr * 2L) else 2000L
+            val mixedFile = mixBgMusic(wavFile, item.bgSeq) ?: wavFile
+
+            CaptionLogger.log(TAG, "TTS-WAV[$workerName] ${ms}ms ${durMs}ms bg=${item.bgSeq} '${textToSpeak.take(40)}'")
+            playQueue.offer(PlayItem(textToSpeak, mixedFile, durMs))
         }
     }
 
-    // ── Background music mixing ────────────────────────────────────────────────
     // BG_MIX_VOLUME: bg music at 28% — audible ambience without drowning speech
     private val BG_MIX_VOLUME = 0.28f
 
