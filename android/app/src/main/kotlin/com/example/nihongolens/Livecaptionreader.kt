@@ -28,21 +28,105 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TAG              = "LCReader"
         private const val TRANSLATE_URL    = "http://127.0.0.1:8765/translate_text"
         private const val CONNECT_TIMEOUT  = 3_000
-        // CRITICAL FIX: 6s timeout instead of 35s
-        // CT2 opus-mt should finish in <500ms normally; 6s covers slow cases
-        // Old 35s was causing 20-30s queue backlog that never recovered
         private const val READ_TIMEOUT     = 6_000
         private const val DEBOUNCE_MS      = 400L
         private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
         private const val LANG_CONFIRM     = 3
-        // CRITICAL FIX: Queue cap 3 (was 8)
-        // With 6s timeout and 2 workers: max lag = 3 * 3s = 9s worst case
-        // Old cap=8 with 35s timeout = 280s backlog possible
         private const val QUEUE_CAP        = 3
-        // CRITICAL FIX: Stale threshold 5s (was 15s)
-        // Drop sentences the speaker said >5s ago — they've moved on
-        private const val STALE_MS         = 5_000L
+        private const val STALE_MS         = 8_000L   // raised: sentence may take 2-4s to complete
+
+        // ── SENTENCE COMPLETION SILENCE GAP ──────────────────────────────────
+        // How long LC must be SILENT (no new text) before we treat current buffer as complete sentence.
+        // 900ms: catches natural speaker pauses between sentences without cutting mid-sentence.
+        // Previously 600ms was too short — partial clauses got translated mid-thought.
+        private const val SENTENCE_SILENCE_MS_PRIMARY = 900L   // after hard punctuation or long sentence
+        private const val SENTENCE_SILENCE_MS_SOFT    = 1_400L // after soft comma/clause — wait for more
+
+        // ── MULTILINGUAL HARD SENTENCE-END MARKERS ───────────────────────────
+        // These characters definitively end a sentence in their respective languages.
+        // Translation is triggered IMMEDIATELY (100ms debounce) when text ends with one of these.
+        //
+        // Language coverage:
+        //   English/European:   . ! ?
+        //   Hindi/Devanagari:   । ॥ ! ? (danda = sentence end)
+        //   Chinese/Japanese:   。！？ (fullwidth)
+        //   Korean:             。 ! ?  (uses CJK period + ASCII punct)
+        //   Arabic:             ؟ ۔ (Arabic question mark, Urdu full stop)
+        //   Thai:               ๆ ฯ (though Thai rarely uses sentence-final punct)
+        //   Hebrew:             . ! ?
+        //   Russian/Cyrillic:   . ! ?
+        //   Greek:              . ! ; (Greek semicolon = question mark)
+        //   Spanish/French:     . ! ? … ¡ ¿ (inverted punct = sentence START but we check end)
+        //   German:             . ! ?
+        //   Portuguese:         . ! ?
+        //   Indonesian/Malay:   . ! ?
+        //   Turkish:            . ! ?
+        //   All languages:      … (ellipsis = sentence end with trailing thought)
+        val HARD_END_CHARS = setOf(
+            // ── ASCII (en, es, fr, de, pt, ru, tr, id, ko) ──────────────────
+            '.', '!', '?',
+
+            // ── Fullwidth CJK (zh, ja, ko) ───────────────────────────────────
+            '。', '！', '？',
+
+            // ── Ellipsis variants ─────────────────────────────────────────────
+            '…',       // U+2026 horizontal ellipsis (all languages)
+            '⋯',       // U+22EF midline ellipsis (ja, zh variant)
+            '‼', '⁇', '⁈', '⁉',   // double/combined punct
+
+            // ── Hindi / Devanagari (hi, mr, ne, sa) ──────────────────────────
+            '।', '॥',             // danda, double danda
+            '\u0964', '\u0965',   // same by Unicode codepoint
+
+            // ── Arabic script (ar, ur, fa, ps) ───────────────────────────────
+            '؟',       // U+061F Arabic question mark
+            '۔',       // U+06D4 Urdu full stop
+
+            // ── Ethiopic (am — Amharic, not in our list but safe to add) ─────
+            '\u1362', '\u1367',
+
+            // ── Sundanese / Balinese (id regional scripts) ───────────────────
+            '᪨', '᭞',
+        )
+
+        val SOFT_END_CHARS = setOf(
+            // ── ASCII clause separators (all Latin-script languages) ──────────
+            ',', ';', ':', '-',
+
+            // ── Arabic clause separators ──────────────────────────────────────
+            '،',       // U+060C Arabic comma
+            '؛',       // U+061B Arabic semicolon
+
+            // ── CJK clause separators (zh, ja, ko) ───────────────────────────
+            '、',       // U+3001 ideographic comma (ja, zh)
+            '，',       // U+FF0C fullwidth comma (zh)
+            '；',       // U+FF1B fullwidth semicolon
+            '：',       // U+FF1A fullwidth colon (zh — ends a clause, not sentence)
+            '・',       // U+30FB katakana middle dot (ja)
+
+            // ── Dashes (ru, de, fr, es — em/en dash as clause separator) ─────
+            '—', '–',
+
+            // ── Newline (LC sometimes uses for clause separation) ─────────────
+            '\n',
+        )
+
+        // ── MINIMUM WORDS FOR TRANSLATION ────────────────────────────────────
+        // Don't translate fragments shorter than this — they're almost certainly incomplete.
+        // "So I" (2 words) = fragment. "So I think that" (4 words) = translatable clause.
+        private const val MIN_WORDS_HARD   = 3   // after hard punctuation
+        private const val MIN_WORDS_SOFT   = 6   // after soft punctuation (needs more context)
+        private const val MIN_WORDS_SILENCE = 3  // after silence gap
+
+        // ── WORD-GROWTH THRESHOLD ─────────────────────────────────────────────
+        // LC grows sentences word by word. Translate only when:
+        // - sentence ends with punctuation (above), OR
+        // - silence gap passes, OR
+        // - sentence has grown significantly (15+ words, likely a long LC caption block)
+        // REMOVED: "translate every 5 new words" — this was the cause of partial translation!
+        // Now: only grow-based trigger at 15+ words total (run-on sentence safety net)
+        private const val MAX_WORDS_BEFORE_FORCE = 15
 
         private val LC_PACKAGES = setOf(
             "com.google.android.as",
@@ -280,12 +364,12 @@ class LiveCaptionReader : AccessibilityService() {
     private var sentenceBuffer      = ""
     private var lastBufferEnqueued  = ""
     private var lastLCChangeMs      = 0L
-    private val SENTENCE_SILENCE_MS = 600L
     private var sentenceTimerJob: Job? = null
     private var lastEnqueuedWordCount = 0
     private var lastEnqueuedText      = ""
 
     private fun schedule(text: String) {
+        // ── Language detection ────────────────────────────────────────────────
         val script = detectScript(text)
         if (script != confirmedLang) {
             if (script == pendingLang) {
@@ -304,19 +388,19 @@ class LiveCaptionReader : AccessibilityService() {
         lastLCChangeMs = System.currentTimeMillis()
 
         val trimmed   = text.trim()
-        val words     = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
-        val wordCount = words.size
+        val wordCount = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }.size
+        val lastChar  = trimmed.lastOrNull() ?: return
 
-        val endsWithHardPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
-                                trimmed.endsWith("!") || trimmed.endsWith("。") ||
-                                trimmed.endsWith("？") || trimmed.endsWith("！") ||
-                                trimmed.endsWith("…")
-        if (endsWithHardPunct && wordCount >= 3) {
+        // ── RULE 1: HARD sentence-end punctuation ─────────────────────────────
+        // Covers: . ! ? 。！？ । ॥ ؟ ۔ … and all other definitive sentence-end chars
+        // These mean the sentence is DEFINITELY complete — translate immediately.
+        if (lastChar in HARD_END_CHARS && wordCount >= MIN_WORDS_HARD) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(100)
+                delay(80)  // 80ms debounce — wait for LC to finalize this text
                 val t = sentenceBuffer.trim()
                 if (t.isNotBlank() && t != lastEnqueuedText) {
+                    CaptionLogger.log(TAG, "HARD-END '${lastChar}' wc=$wordCount")
                     lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
                     enqueue(t); sentenceBuffer = ""
                 }
@@ -324,47 +408,58 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        val endsWithSoftPunct = trimmed.endsWith(",") || trimmed.endsWith(";") ||
-                                trimmed.endsWith(":") || trimmed.endsWith(" -") ||
-                                trimmed.endsWith("—")
-        if (endsWithSoftPunct && wordCount >= 5) {
+        // ── RULE 2: SOFT clause-end punctuation ───────────────────────────────
+        // , ; : — etc. May or may not end the sentence.
+        // Wait 1.4s silence. If LC adds more words → accumulate. If silent → translate.
+        if (lastChar in SOFT_END_CHARS && wordCount >= MIN_WORDS_SOFT) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
-            pendingJob = scope.launch {
-                delay(350)
+            sentenceTimerJob = scope.launch {
+                delay(SENTENCE_SILENCE_MS_SOFT)
                 val t = sentenceBuffer.trim()
-                if (t.isNotBlank() && t != lastEnqueuedText) {
-                    lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
+                val wc = t.split(Regex("\\s+")).filter { it.isNotBlank() }.size
+                if (t.isNotBlank() && t != lastEnqueuedText && wc >= MIN_WORDS_SOFT) {
+                    CaptionLogger.log(TAG, "SOFT-END '${lastChar}' wc=$wc after ${SENTENCE_SILENCE_MS_SOFT}ms")
+                    lastEnqueuedText = t; lastEnqueuedWordCount = wc
                     enqueue(t); sentenceBuffer = ""
                 }
             }
             return
         }
 
-        val grown = wordCount - lastEnqueuedWordCount
-        if ((grown >= 5 && wordCount >= 5) || (wordCount >= 8 && grown >= 3)) {
+        // ── RULE 3: SAFETY NET — very long sentence (run-on, no punctuation) ──
+        // Some LC captions never add punctuation (filler speech, lists, etc.)
+        // After 15 words, translate what we have to avoid indefinite accumulation.
+        if (wordCount >= MAX_WORDS_BEFORE_FORCE && wordCount > lastEnqueuedWordCount + 8) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(150)
+                delay(200)  // brief debounce
                 val t = sentenceBuffer.trim()
-                if (t.isNotBlank() && t != lastEnqueuedText) {
-                    lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
+                val wc = t.split(Regex("\\s+")).filter { it.isNotBlank() }.size
+                if (t.isNotBlank() && t != lastEnqueuedText && wc >= MIN_WORDS_SILENCE) {
+                    CaptionLogger.log(TAG, "FORCE wc=$wc (>$MAX_WORDS_BEFORE_FORCE, no punct)")
+                    lastEnqueuedText = t; lastEnqueuedWordCount = wc
                     enqueue(t); sentenceBuffer = ""
                 }
             }
             return
         }
 
+        // ── RULE 4: SILENCE GAP ───────────────────────────────────────────────
+        // No punctuation, sentence not too long yet.
+        // Start a timer: if LC goes silent for 900ms, treat current buffer as complete.
+        // If LC adds more text before timer fires → cancel timer (sentence still growing).
         sentenceTimerJob?.cancel()
+        pendingJob?.cancel()
         sentenceTimerJob = scope.launch {
-            delay(SENTENCE_SILENCE_MS)
+            delay(SENTENCE_SILENCE_MS_PRIMARY)
             val t = sentenceBuffer.trim()
-            if (t.isNotBlank() && t != lastEnqueuedText && wordCount >= 2) {
-                CaptionLogger.log(TAG, "SILENCE translate")
-                lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
+            val wc = t.split(Regex("\\s+")).filter { it.isNotBlank() }.size
+            if (t.isNotBlank() && t != lastEnqueuedText && wc >= MIN_WORDS_SILENCE) {
+                CaptionLogger.log(TAG, "SILENCE ${SENTENCE_SILENCE_MS_PRIMARY}ms wc=$wc")
+                lastEnqueuedText = t; lastEnqueuedWordCount = wc
                 enqueue(t); sentenceBuffer = ""
             }
         }
-        pendingJob?.cancel()
     }
 
     private fun enqueue(text: String) {
