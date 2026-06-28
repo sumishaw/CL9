@@ -149,9 +149,11 @@ class LiveCaptionReader : AccessibilityService() {
     private data class QItem(val seq: Long, val text: String, val enqMs: Long = System.currentTimeMillis())
     private val queue      = LinkedBlockingQueue<QItem>()
     private val seqCounter = AtomicLong(0)
-    // Tracks which texts are currently being translated — prevents W1 and W2 both
-    // translating the same sentence simultaneously (was causing 10+ CT2 TIMEOUT cascade)
-    private val activeTranslations = mutableSetOf<String>()
+    // Thread-safe set: tracks texts currently being translated by any worker
+    // ConcurrentHashMap.newKeySet() is thread-safe unlike mutableSetOf() (LinkedHashSet)
+    // synchronized{} with LinkedHashSet can still throw ConcurrentModificationException
+    // across coroutine dispatch threads → workerLoop dies silently → no translations
+    private val activeTranslations = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     @Volatile private var expectedSeq = 0L
 
     // Translation LRU cache — avoid re-translating same sentence
@@ -645,10 +647,7 @@ class LiveCaptionReader : AccessibilityService() {
             // Dedup: if the same text is already being translated by another worker,
             // skip this item — the other worker's result will be cached and reused.
             // Prevents W1 and W2 both spending 5s on the same sentence.
-            val alreadyRunning = synchronized(activeTranslations) {
-                if (activeTranslations.contains(nText)) true
-                else { activeTranslations.add(nText); false }
-            }
+            val alreadyRunning = !activeTranslations.add(nText)  // atomic add; returns false if already present
             if (alreadyRunning) {
                 CaptionLogger.log(TAG, "DEDUP[$name] $seq already translating same text")
                 // Wait for cache to be populated by the other worker
@@ -662,12 +661,12 @@ class LiveCaptionReader : AccessibilityService() {
                         break
                     }
                 }
-                synchronized(activeTranslations) { activeTranslations.remove(nText) }
+                activeTranslations.remove(nText)
                 continue
             }
 
             val result = callServer(text)
-            synchronized(activeTranslations) { activeTranslations.remove(nText) }
+            activeTranslations.remove(nText)
             val ms     = System.currentTimeMillis() - t0
 
             // CRITICAL FIX: With 6s timeout, if it still takes >4s the sentence is too old
