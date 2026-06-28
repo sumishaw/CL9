@@ -127,36 +127,39 @@ object HindiTtsService {
         // Initialize Android TTS — discover hi-IN voices and select Voice II (female) / Voice IV (male)
         tts = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                // Enumerate all available hi-IN voices, sorted alphabetically (matches Settings order)
-                val hiVoices = tts?.voices
-                    ?.filter { v ->
-                        (v.locale.language == "hi" || v.locale.toLanguageTag().startsWith("hi")) &&
-                        !v.isNetworkConnectionRequired
-                    }
-                    ?.sortedBy { it.name }
-                    ?: emptyList()
+                try {
+                    // Enumerate all available hi-IN voices, sorted alphabetically (matches Settings order)
+                    val hiVoices = tts?.voices
+                        ?.filter { v ->
+                            (v.locale.language == "hi" || v.locale.toLanguageTag().startsWith("hi")) &&
+                            !v.isNetworkConnectionRequired
+                        }
+                        ?.sortedBy { it.name }
+                        ?: emptyList()
 
-                CaptionLogger.log(TAG, "hi-IN voices found: ${hiVoices.size}")
-                hiVoices.forEachIndexed { i, v ->
-                    CaptionLogger.log(TAG, "  Voice ${i+1}: ${v.name} quality=${v.quality}")
+                    CaptionLogger.log(TAG, "hi-IN voices found: ${hiVoices.size}")
+                    hiVoices.forEachIndexed { i, v ->
+                        CaptionLogger.log(TAG, "  Voice ${i+1}: ${v.name} quality=${v.quality}")
+                    }
+
+                    voiceFemale = hiVoices.getOrNull(1)  // Voice II
+                    voiceMale   = hiVoices.getOrNull(3)  // Voice IV
+
+                    if (voiceFemale == null && hiVoices.isNotEmpty())
+                        voiceFemale = hiVoices.getOrNull(0)
+                    if (voiceMale == null && hiVoices.size >= 2)
+                        voiceMale = hiVoices.getOrNull(1) ?: voiceFemale
+
+                    CaptionLogger.log(TAG, "FEMALE voice: ${voiceFemale?.name ?: "not found"}")
+                    CaptionLogger.log(TAG, "MALE voice:   ${voiceMale?.name ?: "not found"}")
+
+                } catch (e: Exception) {
+                    // Voice enumeration failed — TTS still works with default voice
+                    CaptionLogger.log(TAG, "Voice enum failed: ${e.message} — using default hi-IN")
+                    voiceFemale = null; voiceMale = null
                 }
 
-                // User confirmed: Voice II = female (index 1), Voice IV = male (index 3)
-                // Indices are 0-based in the sorted list
-                voiceFemale = hiVoices.getOrNull(1)  // Voice II
-                voiceMale   = hiVoices.getOrNull(3)  // Voice IV
-
-                // Fallback: if fewer than 4 voices, use what's available
-                if (voiceFemale == null && hiVoices.isNotEmpty())
-                    voiceFemale = hiVoices.getOrNull(0)
-                if (voiceMale == null && hiVoices.size >= 2)
-                    voiceMale = hiVoices.getOrNull(1)
-                    ?: voiceFemale  // last resort: same voice, different pitch
-
-                CaptionLogger.log(TAG, "FEMALE voice: ${voiceFemale?.name ?: "not found"}")
-                CaptionLogger.log(TAG, "MALE voice:   ${voiceMale?.name ?: "not found"}")
-
-                // Set default locale as fallback
+                // Set default locale
                 val result = tts?.setLanguage(Locale("hi", "IN"))
                 if (result == TextToSpeech.LANG_MISSING_DATA ||
                     result == TextToSpeech.LANG_NOT_SUPPORTED) {
@@ -164,13 +167,11 @@ object HindiTtsService {
                     CaptionLogger.log(TAG, "TTS: hi-IN not found, using generic hi")
                 }
 
-                // Set audio attributes to USAGE_ASSISTANT (excluded from LC capture)
                 tts?.setAudioAttributes(AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANT)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build())
 
-                // Utterance listener for async synthesis completion
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {}
                     override fun onDone(utteranceId: String?) {
@@ -182,6 +183,7 @@ object HindiTtsService {
                 })
 
                 ttsReady = true
+                CaptionLogger.log(TAG, "TTS READY — female=${voiceFemale?.name ?: "default"} male=${voiceMale?.name ?: "default"}")
             } else {
                 CaptionLogger.log(TAG, "TTS init failed: $status")
             }
@@ -219,7 +221,12 @@ object HindiTtsService {
     // ── Speak ─────────────────────────────────────────────────────────────────
 
     fun speak(hindi: String, srcText: String = "") {
-        if (!enabled || hindi.isBlank() || !ttsReady) return
+        if (!enabled) return
+        if (hindi.isBlank()) return
+        if (!ttsReady) {
+            CaptionLogger.log(TAG, "SPEAK-WAIT ttsReady=false, dropping '${hindi.take(20)}'")
+            return
+        }
         val n = hindi.trim().replace(Regex("\\s+"), " ")
 
         val isFemale = when (selectedGender) {
