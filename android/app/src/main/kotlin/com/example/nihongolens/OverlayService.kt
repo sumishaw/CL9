@@ -191,7 +191,11 @@ class OverlayService : Service() {
             backlog.poll()
         }
 
-        val item = backlog.poll() ?: run { active = false; return }
+        val item = backlog.poll() ?: run {
+            active = false
+            CaptionLogger.log("Overlay", "advance: backlog empty — subtitle stays visible", CaptionLogger.LEVEL_DEBUG)
+            return
+        }
         if (item.token < expectedToken) { advance(); return }
 
         active = true
@@ -201,16 +205,20 @@ class OverlayService : Service() {
 
         // In Live mode: hold 10s max (will be replaced by next translation before that)
         // In timed mode: hold for holdMs then advance
-        val hold = if (holdMs == 0L) 10_000L else holdMs
+        val hold = if (holdMs == 0L) 60_000L else holdMs  // 60s: never expire before next sentence
 
         holdRunnable = Runnable {
             holdRunnable = null
             if (!alive) return@Runnable
-            if (item.token < expectedToken) { active = false; fadeOut(); return@Runnable }
+            // FIX: Never fade when backlog empty — keep last subtitle visible
+            // until silence timer (60s) or next translation replaces it.
+            // Old: fadeOut() here caused overlay to disappear mid-conversation.
             if (backlog.isNotEmpty()) {
                 active = false; advance()
             } else {
-                fadeOut(); active = false
+                // Nothing queued yet — stay visible, next sentence will replace
+                active = false
+                CaptionLogger.log("Overlay", "hold-expire: staying visible, no next sentence yet")
             }
         }
         handler.postDelayed(holdRunnable!!, hold)
@@ -246,7 +254,8 @@ class OverlayService : Service() {
     }
 
     private fun fadeOut() {
-        CaptionLogger.onOverlayFadeOut("silence_timer")
+        val curText = textView?.text?.toString() ?: ""
+        CaptionLogger.onOverlayFadeOut("called — text='${curText.take(30)}' backlog=${backlog.size} active=$active")
         textView?.animate()?.cancel()
         textView?.animate()?.alpha(0f)?.setDuration(250)
             ?.withEndAction {
