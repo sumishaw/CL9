@@ -26,7 +26,8 @@ class LiveCaptionReader : AccessibilityService() {
 
     companion object {
         private const val TAG              = "LCReader"
-        private const val TRANSLATE_URL    = "http://127.0.0.1:8765/translate_text"
+        private const val TRANSLATE_URL      = "http://127.0.0.1:8765/translate_text"
+        private const val IS_COMPLETE_URL    = "http://127.0.0.1:8765/is_complete"
         private const val CONNECT_TIMEOUT  = 3_000
         private const val READ_TIMEOUT     = 6_000
         private const val DEBOUNCE_MS      = 400L
@@ -516,15 +517,37 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
-        // ── RULE 4: SILENCE GAP ───────────────────────────────────────────────
+        // ── RULE 4: SMART SILENCE GAP ────────────────────────────────────────
+        // Uses /is_complete to decide silence duration:
+        //   Complete sentence (e.g. "Funny, I'm so sorry.") → 500ms wait
+        //   Incomplete fragment (e.g. "But the end of") → 1400ms wait
+        // This prevents flooding CT2 with tiny mid-sentence fragments from rapid dialogue.
         sentenceTimerJob?.cancel(); pendingJob?.cancel()
-        if (newWords >= 5) {
+        if (newWords >= 3) {
             sentenceTimerJob = scope.launch {
-                delay(SENTENCE_SILENCE_MS_PRIMARY)
+                // Quick check: is the current buffer a complete sentence?
                 val t = sentenceBuffer.trim()
-                if (t.isNotBlank() && t != lastEnqueuedText && wc(t) >= 5) {
-                    CaptionLogger.log(TAG, "SILENCE ${SENTENCE_SILENCE_MS_PRIMARY}ms wc=${wc(t)}")
-                    doSubmit(t, totalWords)
+                val silenceMs = if (wc(t) >= 10) {
+                    // Long text — definitely translate after short silence
+                    500L
+                } else if (wc(t) >= 5) {
+                    // Medium: check completeness (local call, <5ms)
+                    val complete = withContext(Dispatchers.IO) { isCompleteSentence(t) }
+                    if (complete) {
+                        CaptionLogger.log(TAG, "SMART-COMPLETE wc=${wc(t)} — fast silence 500ms")
+                        500L   // complete sentence: translate quickly
+                    } else {
+                        CaptionLogger.log(TAG, "SMART-INCOMPLETE wc=${wc(t)} — slow silence 1400ms")
+                        1_400L // fragment: wait longer for more text
+                    }
+                } else {
+                    1_400L // too short: always wait for more
+                }
+                delay(silenceMs)
+                val t2 = sentenceBuffer.trim()
+                if (t2.isNotBlank() && t2 != lastEnqueuedText && wc(t2) >= 3) {
+                    CaptionLogger.log(TAG, "SMART-SILENCE ${silenceMs}ms wc=${wc(t2)}")
+                    doSubmit(t2, totalWords)
                 }
             }
         }
@@ -619,6 +642,21 @@ class LiveCaptionReader : AccessibilityService() {
         // 2 parallel workers — doubles throughput
         translateJob  = scope.launch { workerLoop("W1") }
         translateJob2 = scope.launch { workerLoop("W2") }
+    }
+
+    private fun isCompleteSentence(text: String): Boolean {
+        return try {
+            val enc = java.net.URLEncoder.encode(text.trim(), "UTF-8")
+            val conn = java.net.URL("$IS_COMPLETE_URL?text=$enc")
+                .openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 300
+            conn.readTimeout    = 300
+            if (conn.responseCode == 200) {
+                val resp = conn.inputStream.bufferedReader().readText()
+                conn.disconnect()
+                resp.contains("\"complete\": true") || resp.contains("\"complete\":true")
+            } else { conn.disconnect(); true }
+        } catch (e: Exception) { true }
     }
 
     private suspend fun workerLoop(name: String) {
