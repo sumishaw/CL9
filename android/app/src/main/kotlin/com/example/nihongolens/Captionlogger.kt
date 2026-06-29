@@ -94,10 +94,9 @@ object CaptionLogger {
             "SUBTITLE-GONE #$subtitleGoneCount reason=$reason " +
             "lastText='${lastSubtitleText.take(30)}' age=${age}ms",
             LEVEL_ERROR)
+        // State snapshot — TTS.enabled logged here; queue sizes logged by HindiTtsService itself
         log("Overlay",
-            "STATE: TTS.enabled=${HindiTtsService.enabled} " +
-            "fetchQ=${HindiTtsService.fetchQueueSize()} " +
-            "playQ=${HindiTtsService.playQueueSize()}",
+            "STATE: TTS.enabled=${HindiTtsService.enabled} speaking=${HindiTtsService.isSpeaking}",
             LEVEL_ERROR)
     }
 
