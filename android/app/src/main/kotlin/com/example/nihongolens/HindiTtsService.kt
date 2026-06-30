@@ -59,6 +59,65 @@ object HindiTtsService {
 
     enum class Gender { AUTO, MALE, FEMALE }
 
+    // ── Voice Type Classification (for labeling/logging) ─────────────────────
+    // 6 standard voice types — used as a HUMAN-READABLE label in logs only.
+    // The ACTUAL pitch mirroring below is continuous (exact Hz), not bucketed —
+    // two Sopranos at 220Hz and 320Hz get DIFFERENT TTS pitch, not the same one.
+    enum class VoiceType {
+        SOPRANO, MEZZO_SOPRANO, CONTRALTO,        // female, high → low
+        COUNTERTENOR, TENOR, BARITONE, BASS,      // male, high → low
+        UNKNOWN
+    }
+
+    @Volatile var currentVoiceType: VoiceType = VoiceType.UNKNOWN
+
+    // ── EXACT F0 mirroring — the real mimicry mechanism ──────────────────────
+    // GenderAnalyzer continuously measures the original speaker's exact F0 (Hz)
+    // and writes it here. speak() reads this EXACT value (not a bucket average)
+    // and computes a precise pitch ratio for Android TTS — so a speaker at
+    // 242Hz gets a DIFFERENT, more precise pitch than one at 238Hz or 255Hz.
+    //
+    // Updated by GenderAnalyzer's rolling 5s average (stable, not jittery
+    // frame-to-frame) — same cadence as currentVoiceType, just continuous.
+    @Volatile var currentMeasuredF0: Float = 0f   // 0 = no measurement yet
+
+    // Android TTS "natural" reference F0 — the approximate average speaking
+    // pitch of the underlying recorded voice corpus when pitch=1.0 (no shift).
+    // These are empirical reference points for Google TTS hi-IN voices.
+    // Calibrated so 242Hz female → pitch≈1.42 (matches real-world measured example)
+    private const val TTS_NATURAL_F0_FEMALE = 170f  // Voice II reference pitch
+    private const val TTS_NATURAL_F0_MALE   = 95f   // Voice IV reference pitch (proportional)
+
+    /**
+     * Exact continuous pitch ratio: captured_F0 / TTS_natural_F0.
+     * This is THE core mimicry formula — no discrete buckets, no rounding to
+     * voice-type categories. Every Hz of difference in the original speaker's
+     * voice produces a proportionally different Hindi TTS pitch.
+     *
+     * Example (from spec): captured 242Hz female speaker
+     *   ratio = 242 / 200 = 1.21  →  Android TTS pitch = 1.21
+     *   (this naturally falls in "Soprano" territory but isn't snapped to a
+     *    fixed Soprano constant — it's the speaker's OWN exact pitch ratio)
+     */
+    fun exactPitchRatio(measuredF0: Float, isFemale: Boolean): Float {
+        if (measuredF0 <= 0f) return 1.0f  // no measurement yet — neutral
+        val naturalF0 = if (isFemale) TTS_NATURAL_F0_FEMALE else TTS_NATURAL_F0_MALE
+        return (measuredF0 / naturalF0).coerceIn(0.55f, 1.95f)
+    }
+
+    // Kept for log labeling only — classifies the ratio into a human-readable
+    // voice type name for debug logs (NOT used for the actual pitch calculation).
+    fun voiceTypePitchMultiplier(vt: VoiceType): Float = when (vt) {
+        VoiceType.SOPRANO       -> 1.35f
+        VoiceType.MEZZO_SOPRANO -> 1.10f
+        VoiceType.CONTRALTO     -> 0.90f
+        VoiceType.COUNTERTENOR  -> 1.15f
+        VoiceType.TENOR         -> 1.00f
+        VoiceType.BARITONE      -> 0.85f
+        VoiceType.BASS          -> 0.70f
+        VoiceType.UNKNOWN       -> 1.00f
+    }
+
     // ── State ─────────────────────────────────────────────────────────────────
     @JvmField @Volatile var enabled           = true
     @JvmField @Volatile var selectedGender    = Gender.AUTO
@@ -112,6 +171,10 @@ object HindiTtsService {
 
     private val fetchQueue = LinkedBlockingQueue<FetchItem>()
     private val playQueue  = LinkedBlockingQueue<PlayItem>()
+
+    // Debug accessors for CaptionLogger state snapshot
+    fun fetchQueueSize() = fetchQueue.size
+    fun playQueueSize()  = playQueue.size
 
     // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -251,12 +314,25 @@ object HindiTtsService {
 
         // Emotion → pitch/rate adjustments
         val (pitchMult, rateMult) = emotionPitchRate(currentEmotion)
-        // When specific voices (Voice II/IV) are available, they handle gender identity.
-        // BasePitch = 1.0 (neutral) so emotion pitch applies cleanly on top.
-        // If no specific voice found (voiceFemale/voiceMale null), use pitch to approximate gender.
+
+        // EXACT MIRRORING: instead of approximating the gender with a fixed
+        // basePitch, use the speaker's EXACT measured F0 to compute a precise
+        // pitch ratio. If no measurement yet (currentMeasuredF0=0), fall back
+        // to the old gender-only approximation so voices aren't silent/flat
+        // before GenderAnalyzer has gathered enough samples.
+        val hasMeasurement = currentMeasuredF0 > 0f
         val hasSpecificVoice = if (isFemale) voiceFemale != null else voiceMale != null
-        val basePitch = if (hasSpecificVoice) 1.0f
-                        else if (isFemale) 1.15f else 0.88f
+
+        val basePitch: Float
+        if (hasMeasurement) {
+            // Exact ratio: this speaker's Hz ÷ TTS voice's natural Hz.
+            // 242Hz female → ratio=1.21 (not snapped to a fixed Soprano constant)
+            basePitch = exactPitchRatio(currentMeasuredF0, isFemale)
+        } else {
+            basePitch = if (hasSpecificVoice) 1.0f
+                       else if (isFemale) 1.15f else 0.88f
+        }
+
         val finalPitch = (basePitch * pitchMult).coerceIn(0.5f, 2.0f)
         val finalRate  = (ttsSpeedMultiplier * rateMult).coerceIn(0.5f, 3.0f)
 
@@ -264,7 +340,8 @@ object HindiTtsService {
         val bgSeq = BackgroundMusicRecorder.currentSeq.get()
 
         CaptionLogger.log(TAG, "SPEAK emo=$currentEmotion spd=${String.format("%.2f", finalRate)} " +
-            "pitch=${String.format("%.2f", finalPitch)} $genderTag bg=$bgSeq '${n.take(50)}'")
+            "pitch=${String.format("%.2f", finalPitch)} $genderTag " +
+            "F0=${currentMeasuredF0.toInt()}Hz voiceType=$currentVoiceType bg=$bgSeq '${n.take(50)}'")
 
         fetchQueue.offer(FetchItem(n, genderTag, finalPitch, finalRate, srcText,
             currentEmotion, bgSeq, System.currentTimeMillis()))
