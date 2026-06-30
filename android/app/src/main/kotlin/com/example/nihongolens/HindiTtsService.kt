@@ -621,33 +621,38 @@ object HindiTtsService {
     // Range: pitch 0.70–1.40 (wide), rate 0.70–1.40 (wide)
     private fun emotionPitchRate(e: Emotion): Pair<Float, Float> = when (e) {
         // ── Core emotions (very distinct) ────────────────────────────────────
-        Emotion.NEUTRAL    -> Pair(1.00f, 1.00f)   // baseline
-        Emotion.HAPPY      -> Pair(1.25f, 1.20f)   // high pitched, fast, upbeat
-        Emotion.SAD        -> Pair(0.75f, 0.70f)   // low, slow, heavy
-        Emotion.ANGRY      -> Pair(0.85f, 1.30f)   // forceful, clipped, fast
-        Emotion.EXCITED    -> Pair(1.35f, 1.35f)   // very high, very fast
-        Emotion.CURIOUS    -> Pair(1.15f, 0.90f)   // slightly rising, thoughtful
+        // NEUTRAL: was a perfectly flat 1.00/1.00 — since most ordinary dialogue
+        // lands here (the acoustic detector only flags STRONG signals for the
+        // named emotions below), a dead-flat neutral made most everyday speech
+        // sound monotone. A small natural lift/pace makes baseline speech less robotic
+        // without pretending to detect an emotion that wasn't actually measured.
+        Emotion.NEUTRAL    -> Pair(1.04f, 1.05f)   // slight natural lift, not dead flat
+        Emotion.HAPPY      -> Pair(1.30f, 1.25f)   // high pitched, fast, upbeat
+        Emotion.SAD        -> Pair(0.72f, 0.68f)   // low, slow, heavy
+        Emotion.ANGRY      -> Pair(0.82f, 1.35f)   // forceful, clipped, fast
+        Emotion.EXCITED    -> Pair(1.40f, 1.40f)   // very high, very fast
+        Emotion.CURIOUS    -> Pair(1.18f, 0.90f)   // slightly rising, thoughtful
         // ── Textured emotions ────────────────────────────────────────────────
         Emotion.WARM       -> Pair(0.95f, 0.85f)   // gentle, warm, slower
-        Emotion.FEARFUL    -> Pair(1.30f, 1.25f)   // high, fast, tense
-        Emotion.SURPRISED  -> Pair(1.40f, 1.15f)   // very high pitch spike
-        Emotion.SIGHING    -> Pair(0.80f, 0.72f)   // low, very slow, breathy
+        Emotion.FEARFUL    -> Pair(1.32f, 1.28f)   // high, fast, tense
+        Emotion.SURPRISED  -> Pair(1.45f, 1.18f)   // very high pitch spike
+        Emotion.SIGHING    -> Pair(0.78f, 0.70f)   // low, very slow, breathy
         Emotion.SINGING    -> Pair(1.20f, 0.65f)   // less flat than speech, still no melody tracking
-        Emotion.GASPING    -> Pair(1.35f, 1.40f)   // high, very fast
-        Emotion.PANTING    -> Pair(1.20f, 1.38f)   // high, rapid
-        Emotion.MOANING    -> Pair(0.72f, 0.65f)   // very low, very slow
-        Emotion.STRAINED   -> Pair(0.90f, 0.85f)   // strained effort
-        Emotion.GRAVELLY   -> Pair(0.70f, 0.90f)   // very low, rough
-        Emotion.RASPY      -> Pair(0.75f, 0.92f)   // low, slightly raspy
-        Emotion.HUSKY      -> Pair(0.80f, 0.88f)   // husky, low
-        Emotion.WHISPERY   -> Pair(0.90f, 0.78f)   // quiet, slow
-        Emotion.MURMURED   -> Pair(0.85f, 0.75f)   // very quiet, slow
-        Emotion.HUSHED     -> Pair(0.88f, 0.73f)   // hushed whisper
-        Emotion.BREATHY    -> Pair(0.92f, 0.82f)   // breathy, slow
-        Emotion.SULTRY     -> Pair(0.78f, 0.70f)   // very low, very slow
+        Emotion.GASPING    -> Pair(1.38f, 1.42f)   // high, very fast
+        Emotion.PANTING    -> Pair(1.22f, 1.40f)   // high, rapid
+        Emotion.MOANING    -> Pair(0.70f, 0.62f)   // very low, very slow
+        Emotion.STRAINED   -> Pair(0.88f, 0.85f)   // strained effort
+        Emotion.GRAVELLY   -> Pair(0.68f, 0.90f)   // very low, rough
+        Emotion.RASPY      -> Pair(0.73f, 0.92f)   // low, slightly raspy
+        Emotion.HUSKY      -> Pair(0.78f, 0.88f)   // husky, low
+        Emotion.WHISPERY   -> Pair(0.88f, 0.78f)   // quiet, slow
+        Emotion.MURMURED   -> Pair(0.83f, 0.75f)   // very quiet, slow
+        Emotion.HUSHED     -> Pair(0.86f, 0.73f)   // hushed whisper
+        Emotion.BREATHY    -> Pair(0.90f, 0.82f)   // breathy, slow
+        Emotion.SULTRY     -> Pair(0.76f, 0.70f)   // very low, very slow
         Emotion.TENDER     -> Pair(0.95f, 0.80f)   // gentle, soft
-        Emotion.VELVETY    -> Pair(0.85f, 0.78f)   // smooth, low, slow
-        Emotion.DISGUST    -> Pair(0.88f, 1.10f)   // low, sharp, clipped
+        Emotion.VELVETY    -> Pair(0.83f, 0.78f)   // smooth, low, slow
+        Emotion.DISGUST    -> Pair(0.86f, 1.12f)   // low, sharp, clipped
     }
 
     // ── WAV helpers ───────────────────────────────────────────────────────────
