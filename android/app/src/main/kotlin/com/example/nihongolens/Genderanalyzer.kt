@@ -369,7 +369,7 @@ object GenderAnalyzer {
             VoiceAnalyzer.processFrame(latestPcmFrame!!, rms, f0)
         }
 
- && voiceTypeF0History.size >= 15) {
+        if (voiceTypeFrameCount >= 20 && voiceTypeF0History.size >= 15) {
             voiceTypeFrameCount = 0
             val avgF0 = voiceTypeF0History.average().toFloat()
             val classified = classifyVoiceType(avgF0, maj)
