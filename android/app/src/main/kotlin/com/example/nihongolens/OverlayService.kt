@@ -233,9 +233,11 @@ class OverlayService : Service() {
             active = false
             advance()
         }
-        // Nothing queued: KEEP current subtitle visible — no blank flash.
-        // Next sentence will replace it when it arrives (~0.8s CT2 gap).
-        // Silence timer (60s) handles true end-of-content fade.
+        // Always reschedule silence timer after TTS completes.
+        // cancelTimers() above killed it — without this, the timer is dead
+        // and the overlay stays on last sentence forever until the next
+        // setTextDirect() call (which may never come if TTS pipeline stalls).
+        reschedSilence()
     }
 
     // ── View helpers ──────────────────────────────────────────────────────────
