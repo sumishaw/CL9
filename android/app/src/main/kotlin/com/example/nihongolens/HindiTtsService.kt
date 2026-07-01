@@ -756,52 +756,68 @@ object HindiTtsService {
                            naturalF0: Float): String {
 
         fun esc(s: String) = android.text.Html.escapeHtml(s)
-        fun f0ToPct(f0: Float): Int {
-            if (f0 <= 0f) return 0
-            return (((f0 / naturalF0) * basePitch - 1f) * 100f).toInt().coerceIn(-45, 75)
-        }
         fun pctStr(p: Int) = if (p >= 0) "+${p}%" else "${p}%"
 
         val words = text.split(" ").filter { it.isNotBlank() }
         val n = words.size
         if (n == 0) return "<speak>${esc(text)}</speak>"
 
-        // Use 10-point F0 curve when available, fall back to 3-point interpolation
+        // Base pitch percentage from the locked sentence median
+        // This is the STABLE anchor — the same voice throughout the sentence
+        val baseRef = if (sentenceF0 > 0f) sentenceF0
+                      else if (currentMeasuredF0 > 0f) currentMeasuredF0
+                      else naturalF0
+        val basePct = ((basePitch - 1f) * 100f).toInt().coerceIn(-40, 70)
+
+        // No contour data — flat SSML at base pitch (best option: consistent voice)
         val hasMultiPoint = capturedF0Curve.any { it > 0f }
         val hasContour    = startF0 > 0f || peakF0 > 0f || endF0 > 0f
-
         if (!hasMultiPoint && !hasContour) {
-            val bPct = f0ToPct(if (sentenceF0 > 0f) sentenceF0 else if (currentMeasuredF0 > 0f) currentMeasuredF0 else naturalF0)
-            return "<speak><prosody pitch='${pctStr(bPct)}'>${esc(text)}</prosody></speak>"
+            return "<speak><prosody pitch='${pctStr(basePct)}'>${esc(text)}</prosody></speak>"
         }
 
         val fillers = setOf("में","है","का","की","के","को","से","और","एक","यह",
                             "वह","तो","भी","ही","पर","अब","था","थी","थे","हो","हैं")
         val maxRms = if (hasMultiPoint) capturedRmsCurve.max().coerceAtLeast(1f) else 1f
-        val sb = StringBuilder("<speak>")
 
+        // MAX RELATIVE DEVIATION: ±22% from base pitch
+        // This keeps the same voice throughout while still capturing intonation shape.
+        // Without this cap, a shouted word at 350Hz vs whisper at 150Hz = 163% swing
+        // = sounds like completely different voices word to word.
+        val MAX_DEVIATION = 0.22f
+
+        val sb = StringBuilder("<speak>")
         words.forEachIndexed { i, word ->
             val t        = i.toFloat() / (n - 1).coerceAtLeast(1)
             val curvePos = (t * 9).toInt().coerceIn(0, 9)
 
-            // PITCH — from 10-point measured F0 curve (per word, not interpolated sections)
-            val interpF0: Float = if (hasMultiPoint && capturedF0Curve[curvePos] > 0f) {
-                capturedF0Curve[curvePos]
-            } else {
-                val sF0 = if (startF0 > 0f) startF0 else (sentenceF0.takeIf { it > 0f } ?: naturalF0)
-                val pF0 = if (peakF0 > 0f) peakF0 else sF0
-                val eF0 = if (endF0 > 0f) endF0 else sF0
-                if (t <= 0.5f) sF0 + (pF0 - sF0) * (t * 2f)
-                else           pF0 + (eF0 - pF0) * ((t - 0.5f) * 2f)
+            // PITCH: relative deviation from sentence median, clamped to ±22%
+            val curveF0: Float = when {
+                hasMultiPoint && capturedF0Curve[curvePos] > 0f ->
+                    capturedF0Curve[curvePos]
+                hasContour -> {
+                    val sF0 = if (startF0 > 0f) startF0 else baseRef
+                    val pF0 = if (peakF0 > 0f) peakF0 else sF0
+                    val eF0 = if (endF0 > 0f) endF0 else sF0
+                    if (t <= 0.5f) sF0 + (pF0 - sF0) * (t * 2f)
+                    else           pF0 + (eF0 - pF0) * ((t - 0.5f) * 2f)
+                }
+                else -> baseRef
             }
-            val pitchPct = f0ToPct(interpF0)
 
-            // DURATION — from 10-point RMS energy curve
-            // High RMS = stressed word = spoken slower (longer hold) in original
-            // Low RMS = unstressed = spoken faster (shorter) in original
-            val normRms  = if (hasMultiPoint) capturedRmsCurve[curvePos] / maxRms else 0.5f
-            val cleanW   = word.trimEnd('.', ',', '!', '?', '।', '—', '-')
-            val isFiller = cleanW in fillers
+            // Deviation = how much this word's F0 deviates from sentence median
+            // Clamped to ±MAX_DEVIATION so same voice is preserved
+            val deviation = ((curveF0 - baseRef) / baseRef.coerceAtLeast(1f))
+                .coerceIn(-MAX_DEVIATION, MAX_DEVIATION)
+
+            // Final pitch for this word = basePitch adjusted by bounded deviation
+            val wordPitch = basePitch * (1f + deviation)
+            val wordPct   = ((wordPitch - 1f) * 100f).toInt().coerceIn(-40, 70)
+
+            // DURATION: from RMS energy (high energy = stressed = slower)
+            val normRms   = if (hasMultiPoint) capturedRmsCurve[curvePos] / maxRms else 0.5f
+            val cleanW    = word.trimEnd('.', ',', '!', '?', '।', '—', '-')
+            val isFiller  = cleanW in fillers
             val rate = when {
                 isFiller        -> "fast"
                 normRms > 0.75f -> "slow"
@@ -809,7 +825,7 @@ object HindiTtsService {
                 else            -> "fast"
             }
 
-            // STRESS — word at a local RMS peak gets emphasis tag
+            // STRESS: local RMS peak
             val isLocalPeak = hasMultiPoint && normRms > 0.70f &&
                 (curvePos == 0 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos - 1]) &&
                 (curvePos == 9 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos + 1])
@@ -822,7 +838,7 @@ object HindiTtsService {
                 else                      -> ""
             }
 
-            sb.append("<prosody pitch='${pctStr(pitchPct)}' rate='$rate'>")
+            sb.append("<prosody pitch='${pctStr(wordPct)}' rate='$rate'>")
             if (isLocalPeak) sb.append("<emphasis level='moderate'>${esc(word)}</emphasis>")
             else             sb.append(esc(word))
             sb.append("</prosody>$breakAfter")
@@ -832,6 +848,8 @@ object HindiTtsService {
         sb.append("</speak>")
         return sb.toString()
     }
+
+
 
 
 
