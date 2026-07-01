@@ -102,6 +102,7 @@ class OverlayService : Service() {
     private var wordRunnable: Runnable? = null
     private var holdRunnable: Runnable? = null
     private var silenceRunnable: Runnable? = null
+    private var lastTextShownMs: Long = 0L  // timestamp of last subtitle shown
 
     val handler = Handler(Looper.getMainLooper())
 
@@ -205,7 +206,7 @@ class OverlayService : Service() {
 
         // In Live mode: hold 10s max (will be replaced by next translation before that)
         // In timed mode: hold for holdMs then advance
-        val hold = if (holdMs == 0L) 60_000L else holdMs  // 60s: never expire before next sentence
+        val hold = if (holdMs == 0L) 300_000L else holdMs  // 5min: covers long silent scenes
 
         holdRunnable = Runnable {
             holdRunnable = null
@@ -251,8 +252,9 @@ class OverlayService : Service() {
         tv.animate().cancel()
         tv.alpha = 1f   // ALWAYS snap to visible — covers post-music resume
         tv.visibility = android.view.View.VISIBLE
+        lastTextShownMs = System.currentTimeMillis()
         CaptionLogger.onOverlayTextSet(text, 1f, true)
-        reschedSilence()  // reset 60s timer every time subtitle shown
+        reschedSilence()  // reset 300s timer every time subtitle shown
     }
 
     private fun fadeOut() {
@@ -282,20 +284,25 @@ class OverlayService : Service() {
 
     private fun reschedSilence() {
         silenceRunnable?.let { handler.removeCallbacks(it) }
+        val scheduledAt = System.currentTimeMillis()
         silenceRunnable = Runnable {
-            // Only fade if BOTH conditions true:
-            // 1. Backlog empty AND not currently showing a sentence (no fresh content)
-            // 2. TTS is NOT speaking (audio has ended too — not mid-sentence)
-            // Previously faded whenever backlog was empty, which is true between EVERY sentence
-            if (backlog.isEmpty() && !active && !HindiTtsService.isSpeaking) {
-                CaptionLogger.log("Overlay", "silence-timer 60s: genuinely idle → fade")
+            val elapsed = System.currentTimeMillis() - scheduledAt
+            val timeSinceLastText = System.currentTimeMillis() - lastTextShownMs
+            // Only fade when ALL of these are true:
+            // 1. No backlog and not active
+            // 2. TTS not speaking
+            // 3. Last subtitle was shown > 290s ago (nearly the full 300s window)
+            //    — prevents false fade when sentences are still flowing
+            if (backlog.isEmpty() && !active && !HindiTtsService.isSpeaking
+                && timeSinceLastText >= 290_000L) {
+                CaptionLogger.log("Overlay", "silence-timer: genuinely idle ${timeSinceLastText/1000}s → fade")
                 fadeOut()
             } else {
-                CaptionLogger.log("Overlay", "silence-timer 60s: content still active → reschedule")
+                CaptionLogger.log("Overlay", "silence-timer: content active (lastText ${timeSinceLastText/1000}s ago) → reschedule")
                 reschedSilence()  // keep rescheduling while content is flowing
             }
         }
-        handler.postDelayed(silenceRunnable!!, 60_000)
+        handler.postDelayed(silenceRunnable!!, 300_000)  // 5 min: covers long silent scenes
     }
 
     // ── Overlay window ────────────────────────────────────────────────────────
