@@ -251,11 +251,21 @@ class OverlayService : Service() {
         tv.animate().cancel()
         tv.alpha = 1f   // ALWAYS snap to visible — covers post-music resume
         tv.visibility = android.view.View.VISIBLE
+        CaptionLogger.onOverlayTextSet(text, 1f, true)
+        reschedSilence()  // reset 60s timer every time subtitle shown
     }
 
     private fun fadeOut() {
         val curText = textView?.text?.toString() ?: ""
         CaptionLogger.onOverlayFadeOut("called — text='${curText.take(30)}' backlog=${backlog.size} active=$active")
+
+        // AUTO-RECOVERY: If TTS is still speaking when fadeOut fires,
+        // don't fade — the audio is still going, subtitle should stay visible.
+        if (HindiTtsService.isSpeaking) {
+            CaptionLogger.log("Overlay", "fadeOut BLOCKED — TTS still speaking, keeping subtitle visible")
+            return
+        }
+
         textView?.animate()?.cancel()
         textView?.animate()?.alpha(0f)?.setDuration(250)
             ?.withEndAction {
@@ -272,8 +282,20 @@ class OverlayService : Service() {
 
     private fun reschedSilence() {
         silenceRunnable?.let { handler.removeCallbacks(it) }
-        silenceRunnable = Runnable { if (backlog.isEmpty() && !active) fadeOut() }
-        handler.postDelayed(silenceRunnable!!, 60_000)  // 60s: music can be long
+        silenceRunnable = Runnable {
+            // Only fade if BOTH conditions true:
+            // 1. Backlog empty AND not currently showing a sentence (no fresh content)
+            // 2. TTS is NOT speaking (audio has ended too — not mid-sentence)
+            // Previously faded whenever backlog was empty, which is true between EVERY sentence
+            if (backlog.isEmpty() && !active && !HindiTtsService.isSpeaking) {
+                CaptionLogger.log("Overlay", "silence-timer 60s: genuinely idle → fade")
+                fadeOut()
+            } else {
+                CaptionLogger.log("Overlay", "silence-timer 60s: content still active → reschedule")
+                reschedSilence()  // keep rescheduling while content is flowing
+            }
+        }
+        handler.postDelayed(silenceRunnable!!, 60_000)
     }
 
     // ── Overlay window ────────────────────────────────────────────────────────
