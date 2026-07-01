@@ -762,36 +762,44 @@ object HindiTtsService {
         val n = words.size
         if (n == 0) return "<speak>${esc(text)}</speak>"
 
-        // Base pitch percentage from the locked sentence median
-        // This is the STABLE anchor — the same voice throughout the sentence
+        // Sentence base pitch from locked median
         val baseRef = if (sentenceF0 > 0f) sentenceF0
                       else if (currentMeasuredF0 > 0f) currentMeasuredF0
                       else naturalF0
         val basePct = ((basePitch - 1f) * 100f).toInt().coerceIn(-40, 70)
 
-        // No contour data — flat SSML at base pitch (best option: consistent voice)
+        // No contour → single flat pitch for whole sentence (most consistent)
         val hasMultiPoint = capturedF0Curve.any { it > 0f }
         val hasContour    = startF0 > 0f || peakF0 > 0f || endF0 > 0f
         if (!hasMultiPoint && !hasContour) {
             return "<speak><prosody pitch='${pctStr(basePct)}'>${esc(text)}</prosody></speak>"
         }
 
-        val fillers = setOf("में","है","का","की","के","को","से","और","एक","यह",
-                            "वह","तो","भी","ही","पर","अब","था","थी","थे","हो","हैं")
-        val maxRms = if (hasMultiPoint) capturedRmsCurve.max().coerceAtLeast(1f) else 1f
+        // ── RATE: ONE value for the whole sentence from VoiceAnalyzer ────────
+        // DO NOT vary rate per-word. Per-word rate from RMS creates a
+        // bell-curve slow-middle/fast-edges pattern on EVERY sentence
+        // because RMS always rises then falls (physics of speech).
+        // Instead: one measured rate for the whole sentence.
+        val sentenceRate: String = when {
+            voiceProfile?.syllableRate ?: 0f > 6.5f -> "x-fast"
+            voiceProfile?.syllableRate ?: 0f > 5.5f -> "fast"
+            voiceProfile?.syllableRate ?: 0f < 2.5f -> "x-slow"
+            voiceProfile?.syllableRate ?: 0f < 3.5f -> "slow"
+            else                                     -> "medium"
+        }
 
-        // MAX RELATIVE DEVIATION: ±22% from base pitch
-        // This keeps the same voice throughout while still capturing intonation shape.
-        // Without this cap, a shouted word at 350Hz vs whisper at 150Hz = 163% swing
-        // = sounds like completely different voices word to word.
-        val MAX_DEVIATION = 0.22f
+        // ── PITCH: ±22% relative deviation per word (intonation shape) ───────
+        // MAX_DEVIATION bounds how far any word can stray from the sentence base.
+        // Keeps the same voice throughout while preserving natural intonation.
+        val MAX_DEV = 0.22f
 
-        val sb = StringBuilder("<speak>")
+        val sb = StringBuilder("<speak><prosody rate='$sentenceRate'>")
+
         words.forEachIndexed { i, word ->
             val t        = i.toFloat() / (n - 1).coerceAtLeast(1)
             val curvePos = (t * 9).toInt().coerceIn(0, 9)
 
-            // PITCH: relative deviation from sentence median, clamped to ±22%
+            // Per-word pitch deviation (relative to sentence median, clamped)
             val curveF0: Float = when {
                 hasMultiPoint && capturedF0Curve[curvePos] > 0f ->
                     capturedF0Curve[curvePos]
@@ -805,32 +813,18 @@ object HindiTtsService {
                 else -> baseRef
             }
 
-            // Deviation = how much this word's F0 deviates from sentence median
-            // Clamped to ±MAX_DEVIATION so same voice is preserved
             val deviation = ((curveF0 - baseRef) / baseRef.coerceAtLeast(1f))
-                .coerceIn(-MAX_DEVIATION, MAX_DEVIATION)
-
-            // Final pitch for this word = basePitch adjusted by bounded deviation
+                .coerceIn(-MAX_DEV, MAX_DEV)
             val wordPitch = basePitch * (1f + deviation)
             val wordPct   = ((wordPitch - 1f) * 100f).toInt().coerceIn(-40, 70)
 
-            // DURATION: from RMS energy (high energy = stressed = slower)
-            val normRms   = if (hasMultiPoint) capturedRmsCurve[curvePos] / maxRms else 0.5f
-            val cleanW    = word.trimEnd('.', ',', '!', '?', '।', '—', '-')
-            val isFiller  = cleanW in fillers
-            val rate = when {
-                isFiller        -> "fast"
-                normRms > 0.75f -> "slow"
-                normRms > 0.40f -> "medium"
-                else            -> "fast"
-            }
+            // Stress: only at measured RMS peak (not positional)
+            val isLocalPeak = hasMultiPoint &&
+                capturedRmsCurve[curvePos] / capturedRmsCurve.max().coerceAtLeast(1f) > 0.85f &&
+                (curvePos == 0 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos-1]) &&
+                (curvePos == 9 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos+1])
 
-            // STRESS: local RMS peak
-            val isLocalPeak = hasMultiPoint && normRms > 0.70f &&
-                (curvePos == 0 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos - 1]) &&
-                (curvePos == 9 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos + 1])
-
-            // PAUSES from punctuation
+            // Punctuation pauses
             val breakAfter = when (word.lastOrNull()) {
                 '.', '!', '?', '।', '॥' -> "<break time='180ms'/>"
                 ','                       -> "<break time='80ms'/>"
@@ -838,16 +832,18 @@ object HindiTtsService {
                 else                      -> ""
             }
 
-            sb.append("<prosody pitch='${pctStr(wordPct)}' rate='$rate'>")
+            sb.append("<prosody pitch='${pctStr(wordPct)}'>")
             if (isLocalPeak) sb.append("<emphasis level='moderate'>${esc(word)}</emphasis>")
             else             sb.append(esc(word))
             sb.append("</prosody>$breakAfter")
             if (i < n - 1) sb.append(" ")
         }
 
-        sb.append("</speak>")
+        sb.append("</prosody></speak>")
         return sb.toString()
     }
+
+
 
 
 
