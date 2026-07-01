@@ -326,7 +326,7 @@ object GenderAnalyzer {
             // New speaker confirmed — reset all speaker-specific state
             voiceTypeF0History.clear()
             HindiTtsService.currentMeasuredF0 = 0f
-            HindiTtsService.updateEmaF0(f0, maj)  // seed EMA with new speaker's F0
+            HindiTtsService.resetSentenceF0()  // new speaker — clear sentence F0 buffer
         }
 
         // ── Voice Type classification ─────────────────────────────────────────
@@ -360,7 +360,7 @@ object GenderAnalyzer {
                 HindiTtsService.currentMeasuredF0 = avgF0
                 // Feed voiced-speech F0 into EMA — keeps same speaker's pitch stable
                 // across all their sentences without wild jumps from music/silence frames
-                HindiTtsService.updateEmaF0(avgF0, maj)
+                HindiTtsService.addF0Frame(avgF0, maj)  // feeds per-sentence median buffer
             }
         }
 
@@ -463,6 +463,10 @@ object GenderAnalyzer {
         }
         CaptionLogger.log("GenderAnalyzer",
             "CONTOUR-10pt [${capturedF0Curve.map{it.toInt()}.joinToString(",")}] $shape")
+
+        // Lock per-sentence median F0 — computed from all voiced frames this sentence
+        // This gives HindiTtsService ONE stable base pitch for the whole sentence
+        HindiTtsService.lockSentenceF0()
 
         // Reset for next sentence
         contourF0Buffer.clear()
