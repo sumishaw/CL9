@@ -90,59 +90,67 @@ object HindiTtsService {
     //
     // Updated by GenderAnalyzer's rolling 5s average (stable, not jittery
     // frame-to-frame) — same cadence as currentVoiceType, just continuous.
-    @Volatile var currentMeasuredF0: Float = 0f   // 0 = no measurement yet
+    @Volatile var currentMeasuredF0: Float = 0f   // raw rolling average (used for contour)
 
-    // ── Speaker baseline F0 (locked per speaker session) ─────────────────────
-    // After enough voiced speech frames accumulate, we LOCK the speaker's
-    // baseline F0. This prevents the pitch from drifting sentence-to-sentence
-    // as the rolling average shifts. The lock holds until the gender detector
-    // confirms a genuine speaker change (MIN_SWITCH_INTERVAL = 12s).
-    // Result: same speaker's Hindi TTS pitch stays CONSISTENT across all
-    // their sentences — doesn't randomly become another person mid-conversation.
-    @Volatile var lockedSpeakerF0: Float = 0f   // 0 = not yet locked
-    @Volatile var lockedSpeakerGender: Gender = Gender.AUTO
-    private const val LOCK_MIN_FRAMES = 20      // need 20+ voiced frames to lock
-    @Volatile var lockedFrameCount: Int = 0
+    // ── EMA-smoothed F0 — the key to consistent same-speaker pitch ────────────
+    // Problem: currentMeasuredF0 (rolling 5s avg) jumps sentence-to-sentence
+    // because music/silence frames contaminate the window, making the same male
+    // voice sound like a different male voice each sentence.
+    //
+    // Solution: Exponential Moving Average with low alpha (very slow to change).
+    //   new_ema = alpha * new_sample + (1-alpha) * old_ema
+    //   alpha=0.08 → very slow drift, very stable across sentences
+    //   A sudden spike (noise/music) barely moves it — needs many consistent
+    //   frames to shift, which only happens with a genuine speaker change.
+    //
+    // This is THE number used for the TTS base pitch — not currentMeasuredF0.
+    @Volatile var emaF0: Float = 0f           // EMA-smoothed F0 for TTS pitch
+    @Volatile var emaGender: Gender = Gender.AUTO  // which gender the EMA tracks
+    private const val EMA_ALPHA      = 0.08f  // low = very stable (changes slowly)
+    private const val EMA_ALPHA_INIT = 0.35f  // higher for first few frames (faster convergence)
+    @Volatile var emaFrameCount: Int = 0      // frames accumulated so far
 
-    fun tryLockSpeakerF0(measuredF0: Float, gender: Gender) {
-        if (lockedSpeakerF0 > 0f && gender == lockedSpeakerGender) return  // already locked
-        lockedFrameCount++
-        if (lockedFrameCount >= LOCK_MIN_FRAMES && measuredF0 > 0f) {
-            lockedSpeakerF0   = measuredF0
-            lockedSpeakerGender = gender
+    fun updateEmaF0(rawF0: Float, gender: Gender) {
+        if (rawF0 <= 0f) return
+        if (emaGender != gender) {
+            // Speaker changed gender — reset EMA to converge quickly to new speaker
+            emaF0        = rawF0                // seed with current measurement
+            emaGender    = gender
+            emaFrameCount = 1
             CaptionLogger.log("HindiTTS",
-                "SPEAKER-F0-LOCKED: ${gender} baseline=${measuredF0.toInt()}Hz " +
-                "ratio=${String.format("%.2f", exactPitchRatio(measuredF0, gender == Gender.FEMALE))}")
+                "EMA-RESET (gender switch) seed=${rawF0.toInt()}Hz")
+            return
+        }
+        val alpha = if (emaFrameCount < 15) EMA_ALPHA_INIT else EMA_ALPHA
+        emaF0 = alpha * rawF0 + (1f - alpha) * emaF0
+        emaFrameCount++
+        if (emaFrameCount % 30 == 0) {  // log every ~4s
+            CaptionLogger.log("HindiTTS",
+                "EMA-F0: ${emaF0.toInt()}Hz raw=${rawF0.toInt()}Hz " +
+                "ratio=${String.format("%.2f", exactPitchRatio(emaF0, gender == Gender.FEMALE))}",
+                CaptionLogger.LEVEL_DEBUG)
         }
     }
 
-    fun resetSpeakerLock() {
-        lockedSpeakerF0     = 0f
-        lockedSpeakerGender = Gender.AUTO
-        lockedFrameCount    = 0
-        CaptionLogger.log("HindiTTS", "SPEAKER-LOCK-RESET (new speaker detected)")
+    fun resetEma() {
+        emaF0 = 0f; emaGender = Gender.AUTO; emaFrameCount = 0
     }
 
-    // Returns the STABLE pitch ratio for TTS — uses locked baseline when available,
-    // falls back to rolling average, then to gender default
-    fun stablePitchRatio(isFemale: Boolean): Float {
-        val gender = if (isFemale) Gender.FEMALE else Gender.MALE
-        return when {
-            lockedSpeakerF0 > 0f && lockedSpeakerGender == gender ->
-                exactPitchRatio(lockedSpeakerF0, isFemale)  // LOCKED: consistent across sentences
-            currentMeasuredF0 > 0f ->
-                exactPitchRatio(currentMeasuredF0, isFemale) // not yet locked: use rolling average
-            else -> 1.0f  // no data: neutral
-        }
+    // Stable pitch ratio using EMA F0 — same speaker always sounds consistent
+    fun stablePitchRatio(isFemale: Boolean): Float = when {
+        emaF0 > 0f -> exactPitchRatio(emaF0, isFemale)
+        currentMeasuredF0 > 0f -> exactPitchRatio(currentMeasuredF0, isFemale)
+        else -> 1.0f
     }
 
-    // ── Captured F0 contour for SSML prosody ─────────────────────────────────
-    // Written by GenderAnalyzer.flushContour() just before each sentence is
-    // enqueued. speak() reads these to build SSML that mirrors the original
-    // speaker's intonation shape (rising/falling/peaked/flat).
-    @Volatile var capturedStartF0: Float = 0f
+    // ── Captured F0+RMS contour for SSML prosody ────────────────────────────
+    // Written by GenderAnalyzer.flushContour() just before each sentence.
+    // 10-point curves give per-word pitch AND duration accuracy.
+    @Volatile var capturedStartF0: Float = 0f   // legacy 3-point (fallback)
     @Volatile var capturedPeakF0:  Float = 0f
     @Volatile var capturedEndF0:   Float = 0f
+    val capturedF0Curve  = FloatArray(10)  // 10-point F0 across sentence duration
+    val capturedRmsCurve = FloatArray(10)  // 10-point RMS (energy) across sentence
 
     // Android TTS "natural" reference F0 — the approximate average speaking
     // pitch of the underlying recorded voice corpus when pitch=1.0 (no shift).
@@ -239,7 +247,7 @@ object HindiTtsService {
     fun fetchQueueSize() = fetchQueue.size
 
     // Called by GenderAnalyzer when a confirmed gender switch occurs (new speaker)
-    fun onSpeakerChanged() = resetSpeakerLock()
+    // EMA resets automatically in updateEmaF0 when gender changes
     fun playQueueSize()  = playQueue.size
 
     // ── Init ──────────────────────────────────────────────────────────────────
@@ -643,95 +651,84 @@ object HindiTtsService {
                            naturalF0: Float): String {
 
         fun esc(s: String) = android.text.Html.escapeHtml(s)
-
-        // F0 → SSML pitch percentage offset from TTS baseline
         fun f0ToPct(f0: Float): Int {
             if (f0 <= 0f) return 0
-            val ratio = (f0 / naturalF0) * basePitch
-            return ((ratio - 1.0f) * 100f).toInt().coerceIn(-45, 75)
+            return (((f0 / naturalF0) * basePitch - 1f) * 100f).toInt().coerceIn(-45, 75)
         }
-        fun pctStr(pct: Int) = if (pct >= 0) "+${pct}%" else "${pct}%"
-
-        // No contour data → flat SSML at base pitch only
-        val hasContour = startF0 > 0f || peakF0 > 0f || endF0 > 0f
-        if (!hasContour) {
-            val bPct = f0ToPct(if (currentMeasuredF0 > 0f) currentMeasuredF0 else naturalF0)
-            return "<speak><prosody pitch='${pctStr(bPct)}'>${esc(text)}</prosody></speak>"
-        }
+        fun pctStr(p: Int) = if (p >= 0) "+${p}%" else "${p}%"
 
         val words = text.split(" ").filter { it.isNotBlank() }
         val n = words.size
         if (n == 0) return "<speak>${esc(text)}</speak>"
 
-        // Determine contour shape for rate hints
-        val sF0 = if (startF0 > 0f) startF0 else currentMeasuredF0
-        val pF0 = if (peakF0 > 0f) peakF0 else sF0
-        val eF0 = if (endF0 > 0f) endF0 else sF0
-        val peakPos = if (n > 1) n / 2 else 0   // assume peak at middle
+        // Use 10-point F0 curve when available, fall back to 3-point interpolation
+        val hasMultiPoint = capturedF0Curve.any { it > 0f }
+        val hasContour    = startF0 > 0f || peakF0 > 0f || endF0 > 0f
 
-        // ── PER-WORD SSML with interpolated pitch + stress + duration ─────────
-        // For each word at position i:
-        //   pitch: interpolate along the start→peak→end F0 curve
-        //   rate: stressed (peak position) = slightly slower (duration stretches)
-        //         unstressed filler words (short) = slightly faster
-        //   emphasis: word at peak position gets <emphasis level='moderate'>
-        //
-        // This gives EACH WORD its own pitch and duration, closely following
-        // the original speaker's prosodic contour — not just 3 broad sections.
+        if (!hasMultiPoint && !hasContour) {
+            val bPct = f0ToPct(if (emaF0 > 0f) emaF0 else naturalF0)
+            return "<speak><prosody pitch='${pctStr(bPct)}'>${esc(text)}</prosody></speak>"
+        }
+
+        val fillers = setOf("में","है","का","की","के","को","से","और","एक","यह",
+                            "वह","तो","भी","ही","पर","अब","था","थी","थे","हो","हैं")
+        val maxRms = if (hasMultiPoint) capturedRmsCurve.max().coerceAtLeast(1f) else 1f
         val sb = StringBuilder("<speak>")
 
-        // Short filler words that are naturally unstressed/fast in Hindi dialogue
-        val fillers = setOf("में","है","का","की","के","को","से","और","एक","यह","वह",
-                            "तो","भी","ही","पर","अब","था","थी","थे","हो","हैं")
-
         words.forEachIndexed { i, word ->
-            val t = i.toFloat() / (n - 1).coerceAtLeast(1)
+            val t        = i.toFloat() / (n - 1).coerceAtLeast(1)
+            val curvePos = (t * 9).toInt().coerceIn(0, 9)
 
-            // Interpolate F0: start → peak (first half) → end (second half)
-            val interpF0 = if (t <= 0.5f) {
-                sF0 + (pF0 - sF0) * (t * 2f)
+            // PITCH — from 10-point measured F0 curve (per word, not interpolated sections)
+            val interpF0: Float = if (hasMultiPoint && capturedF0Curve[curvePos] > 0f) {
+                capturedF0Curve[curvePos]
             } else {
-                pF0 + (eF0 - pF0) * ((t - 0.5f) * 2f)
+                val sF0 = if (startF0 > 0f) startF0 else (emaF0.takeIf { it > 0f } ?: naturalF0)
+                val pF0 = if (peakF0 > 0f) peakF0 else sF0
+                val eF0 = if (endF0 > 0f) endF0 else sF0
+                if (t <= 0.5f) sF0 + (pF0 - sF0) * (t * 2f)
+                else           pF0 + (eF0 - pF0) * ((t - 0.5f) * 2f)
             }
             val pitchPct = f0ToPct(interpF0)
 
-            // Is this the stressed/peak word?
-            val isStressed = i == peakPos && pF0 > sF0 * 1.10f
-
-            // Rate: stressed word gets slower (longer duration = more weight)
-            // Filler words get faster (natural unstressed shortening)
-            val cleanWord = word.trimEnd('.', ',', '!', '?', '।', '—', '-')
-            val isFiller  = cleanWord in fillers
+            // DURATION — from 10-point RMS energy curve
+            // High RMS = stressed word = spoken slower (longer hold) in original
+            // Low RMS = unstressed = spoken faster (shorter) in original
+            val normRms  = if (hasMultiPoint) capturedRmsCurve[curvePos] / maxRms else 0.5f
+            val cleanW   = word.trimEnd('.', ',', '!', '?', '।', '—', '-')
+            val isFiller = cleanW in fillers
             val rate = when {
-                isStressed -> "slow"
-                isFiller   -> "fast"
-                else       -> "medium"
+                isFiller        -> "fast"
+                normRms > 0.75f -> "slow"
+                normRms > 0.40f -> "medium"
+                else            -> "fast"
             }
 
-            // Pause after sentence-ending punctuation
-            val lastChar = word.lastOrNull()
-            val breakAfter = when (lastChar) {
+            // STRESS — word at a local RMS peak gets emphasis tag
+            val isLocalPeak = hasMultiPoint && normRms > 0.70f &&
+                (curvePos == 0 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos - 1]) &&
+                (curvePos == 9 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos + 1])
+
+            // PAUSES from punctuation
+            val breakAfter = when (word.lastOrNull()) {
                 '.', '!', '?', '।', '॥' -> "<break time='180ms'/>"
                 ','                       -> "<break time='80ms'/>"
-                ';', '—'                 -> "<break time='120ms'/>"
+                ';', '—'                  -> "<break time='120ms'/>"
                 else                      -> ""
             }
 
-            // Build per-word tag
             sb.append("<prosody pitch='${pctStr(pitchPct)}' rate='$rate'>")
-            if (isStressed) {
-                sb.append("<emphasis level='moderate'>${esc(word)}</emphasis>")
-            } else {
-                sb.append(esc(word))
-            }
-            sb.append("</prosody>")
-            sb.append(breakAfter)
+            if (isLocalPeak) sb.append("<emphasis level='moderate'>${esc(word)}</emphasis>")
+            else             sb.append(esc(word))
+            sb.append("</prosody>$breakAfter")
             if (i < n - 1) sb.append(" ")
         }
 
         sb.append("</speak>")
         return sb.toString()
     }
+
+
 
     private suspend fun synthesizeToFile(item: FetchItem): File? =
         synthesizeMutex.withLock {
