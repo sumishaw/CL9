@@ -39,7 +39,9 @@ object GenderAnalyzer {
 
     // Minimum milliseconds between gender switches — prevents double-switching within one sentence
     // Even with HIST=12, rapid pitch variation (music, noise) can still flip quickly
-    private const val MIN_SWITCH_INTERVAL_MS = 3_000L  // at most one switch per 3 seconds
+    // Raised from 3s → 12s: prevents same speaker's voice flipping during
+    // brief music/silence gaps between sentences (music F0 reads as MALE)
+    private const val MIN_SWITCH_INTERVAL_MS = 12_000L
 
     @Volatile var enabled    = false
     @Volatile var lastStatus = "waiting for screen capture permission"
@@ -278,7 +280,9 @@ object GenderAnalyzer {
     private val voiceTypeF0History = ArrayDeque<Float>(40)  // ~5s at 8 samples/sec (frame%5==0 sampling)
     private var voiceTypeFrameCount = 0
     private var lastVoiceTypeSwitchMs = 0L
-    private const val VOICE_TYPE_MIN_SWITCH_MS = 4_000L  // stable — don't flip-flop on noise
+    // 15s: voice type (Soprano/Tenor/Bass etc.) is a stable speaker characteristic
+    // Should only change when speaker genuinely changes, not on momentary noise
+    private const val VOICE_TYPE_MIN_SWITCH_MS = 15_000L
 
     private fun onPitch(f0: Float, rms: Float) {
         frameCount++
@@ -297,8 +301,12 @@ object GenderAnalyzer {
                      else                                   HindiTtsService.detectedGender // no majority → keep current
 
         val nowMs = System.currentTimeMillis()
+        // Extra guard: don't switch gender if RMS indicates silence/music
+        // Low RMS = speaker has stopped talking — pitch reading is noise
+        val isSilenceOrMusic = rms < 120f
         if (maj != HindiTtsService.detectedGender &&
-            nowMs - lastSwitchMs >= MIN_SWITCH_INTERVAL_MS) {
+            nowMs - lastSwitchMs >= MIN_SWITCH_INTERVAL_MS &&
+            !isSilenceOrMusic) {
             lastSwitchMs = nowMs
             HindiTtsService.detectedGender = maj
             // Don't clear spokenTokens on switch — sentences in flight stay valid
@@ -306,15 +314,17 @@ object GenderAnalyzer {
             lastStatus = "MEDIA audio → $maj (F0=${f0.toInt()}Hz)"
             CaptionLogger.log(TAG, ">>> Gender SWITCHED to $maj F0=${f0.toInt()}Hz <<<")
             Log.d(TAG, "Gender→$maj F0=${f0.toInt()} rms=${rms.toInt()}")
-            // New speaker detected (gender flip) — reset voice type window so we
-            // don't blend the old speaker's pitch average into the new one.
+            // New speaker confirmed — reset all speaker-specific state
             voiceTypeF0History.clear()
             HindiTtsService.currentMeasuredF0 = 0f
+            HindiTtsService.onSpeakerChanged()  // unlock F0 baseline for new speaker
         }
 
         // ── Voice Type classification ─────────────────────────────────────────
-        // ── F0 Contour: accumulate for start/peak/end detection ────────────
-        if (f0 > 0f) {
+        // ── F0 Contour: accumulate only voiced speech frames ────────────────
+        // RMS guard: only add to contour buffer when a real voice is detected
+        // Music/silence frames have low RMS and corrupt the start/peak/end measurements
+        if (f0 > 0f && rms >= 150f) {
             contourBuffer.addLast(f0)
             if (contourBuffer.size > 80) contourBuffer.removeFirst()
             if (f0 > contourPeak) contourPeak = f0
@@ -330,12 +340,20 @@ object GenderAnalyzer {
         if (voiceTypeF0History.size > 40) voiceTypeF0History.removeFirst()
         voiceTypeFrameCount++
 
-        // EXACT MIRRORING: update the continuous measured F0 every cycle (not
-        // gated by the 4s stability window above) — this is what HindiTtsService
-        // actually uses for pitch calculation. The rolling average smooths out
-        // frame noise while still tracking the speaker's real pitch closely.
-        if (voiceTypeF0History.size >= 8) {
-            HindiTtsService.currentMeasuredF0 = voiceTypeF0History.average().toFloat()
+        // EXACT MIRRORING: update measured F0 only from VOICED SPEECH frames
+        // RMS floor: frames below this are silence/music noise (not a real speaker)
+        // This prevents music/silence from contaminating the F0 average and
+        // causing the same speaker to sound like a different person between sentences
+        val SPEECH_RMS_FLOOR = 180f  // below this = not voiced speech
+        if (voiceTypeF0History.size >= 8 && rms >= SPEECH_RMS_FLOOR) {
+            val voicedOnly = voiceTypeF0History.filter { it > 80f }
+            if (voicedOnly.size >= 4) {
+                val avgF0 = voicedOnly.average().toFloat()
+                HindiTtsService.currentMeasuredF0 = avgF0
+                // Accumulate frames toward locking the speaker's baseline F0
+                // Once locked, the same speaker's TTS pitch stays stable across sentences
+                HindiTtsService.tryLockSpeakerF0(avgF0, maj)
+            }
         }
 
         if (voiceTypeFrameCount >= 20 && voiceTypeF0History.size >= 15) {
@@ -343,7 +361,8 @@ object GenderAnalyzer {
             val avgF0 = voiceTypeF0History.average().toFloat()
             val classified = classifyVoiceType(avgF0, maj)
             if (classified != HindiTtsService.currentVoiceType &&
-                nowMs - lastVoiceTypeSwitchMs >= VOICE_TYPE_MIN_SWITCH_MS) {
+                nowMs - lastVoiceTypeSwitchMs >= VOICE_TYPE_MIN_SWITCH_MS &&
+                rms >= 180f) {  // only switch voice type during actual speech
                 lastVoiceTypeSwitchMs = nowMs
                 HindiTtsService.currentVoiceType = classified
                 val isFemaleNow = maj == HindiTtsService.Gender.FEMALE
