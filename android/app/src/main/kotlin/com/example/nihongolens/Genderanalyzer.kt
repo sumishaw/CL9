@@ -267,6 +267,8 @@ object GenderAnalyzer {
     //
     // 10 points gives ~10x pitch resolution vs the old 3-point approach —
     // each word maps to its own measured F0 and energy level from the original.
+    private var latestPcmFrame: ShortArray? = null  // latest raw PCM for VoiceAnalyzer
+
     private val contourF0Buffer  = ArrayDeque<Float>(120) // raw F0 frames per sentence
     private val contourRmsBuffer = ArrayDeque<Float>(120) // raw RMS frames per sentence
     private var contourPeak      = 0f
@@ -362,7 +364,12 @@ object GenderAnalyzer {
             }
         }
 
-        if (voiceTypeFrameCount >= 20 && voiceTypeF0History.size >= 15) {
+        // Feed VoiceAnalyzer with current frame metrics for full vocal profile
+        if (latestPcmFrame != null) {
+            VoiceAnalyzer.processFrame(latestPcmFrame!!, rms, f0)
+        }
+
+ && voiceTypeF0History.size >= 15) {
             voiceTypeFrameCount = 0
             val avgF0 = voiceTypeF0History.average().toFloat()
             val classified = classifyVoiceType(avgF0, maj)
