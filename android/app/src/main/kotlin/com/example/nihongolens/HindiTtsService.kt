@@ -763,32 +763,31 @@ object HindiTtsService {
 
     // Build SSML for a sentence.
     //
-    // IMPORTANT: Android TTS does NOT smoothly glide between per-word
-    // <prosody pitch> values — it JUMPS instantly, creating a mechanical
-    // staircase effect that sounds robotic. This is an Android TTS engine
-    // limitation that no parameter tuning can fix.
+    // ANDROID TTS BEHAVIOUR (discovered through testing):
+    //   - Per-word <prosody PITCH> → sounds robotic (instant jumps, no glide)
+    //   - Per-word <prosody RATE>  → sounds natural (duration variation = prosody)
+    //   - Sentence-level pitch via setPitch() → most natural
     //
-    // What DOES work naturally on Android TTS:
-    //   - ONE pitch for the whole sentence (smooth, consistent voice)
-    //   - Emotion-based pitch shift (sentence-level)
-    //   - <emphasis> for stress (subtle, sounds natural)
-    //   - <break> for pauses (works perfectly)
-    //   - ONE rate for the whole sentence
+    // So this function applies:
+    //   - ONE pitch for the whole sentence (from setPitch, already applied)
+    //   - Per-word RATE from measured RMS energy (loud=slow/stressed, quiet=fast)
+    //   - ONE stress emphasis at the measured RMS peak word
+    //   - Punctuation pauses
     //
-    // The per-word pitch variation from the F0 contour is intentionally
-    // REMOVED here. It made the voice sound robotic, not expressive.
+    // This mimics natural prosody: stressed syllables are held longer (slower)
+    // and unstressed syllables are clipped (faster) — exactly what real speech does.
     private fun buildSsml(text: String, basePitch: Float,
                            startF0: Float, peakF0: Float, endF0: Float,
                            naturalF0: Float): String {
 
         fun esc(s: String) = android.text.Html.escapeHtml(s)
-        fun pctStr(p: Int) = if (p >= 0) "+${p}%" else "${p}%"
 
-        // ONE pitch for the entire sentence — the speaker's measured register
-        val pitchPct = ((basePitch - 1f) * 100f).toInt().coerceIn(-25, 45)
+        val words = text.split(" ").filter { it.isNotBlank() }
+        val n = words.size
+        if (n == 0) return "<speak>${esc(text)}</speak>"
 
-        // ONE rate for the entire sentence — from measured syllable rate
-        val sentenceRate: String = when {
+        // Sentence-level rate from measured syllable rate
+        val baseRate: String = when {
             voiceProfile?.syllableRate ?: 0f > 6.5f -> "x-fast"
             voiceProfile?.syllableRate ?: 0f > 5.5f -> "fast"
             voiceProfile?.syllableRate ?: 0f < 2.5f -> "x-slow"
@@ -796,27 +795,43 @@ object HindiTtsService {
             else                                     -> "medium"
         }
 
-        val words = text.split(" ").filter { it.isNotBlank() }
-        val n = words.size
-        if (n == 0) return "<speak>${esc(text)}</speak>"
-
-        // Determine peak stress position from RMS curve
-        // Only ONE word gets emphasis (the actual peak) — not every other word
+        // If no RMS curve data: return simple sentence-rate SSML
         val hasRms = capturedRmsCurve.any { it > 0f }
-        val maxRmsPos = if (hasRms) capturedRmsCurve.indices.maxByOrNull { capturedRmsCurve[it] } ?: -1 else -1
-        val maxRmsVal = if (hasRms) capturedRmsCurve.max() else 0f
-        val stressWordIdx: Int = if (hasRms && maxRmsVal > 0f) {
-            // Map RMS peak position (0-9) to word index
-            (maxRmsPos.toFloat() / 9f * (n - 1)).toInt().coerceIn(0, n - 1)
-        } else -1
+        if (!hasRms) {
+            return "<speak><prosody rate='$baseRate'>${esc(text)}</prosody></speak>"
+        }
 
-        val sb = StringBuilder("<speak><prosody pitch='${pctStr(pitchPct)}' rate='$sentenceRate'>")
+        val maxRms = capturedRmsCurve.max().coerceAtLeast(1f)
+        val minRms = capturedRmsCurve.filter { it > 0f }.minOrNull() ?: 0f
+        val rmsRange = (maxRms - minRms).coerceAtLeast(1f)
 
+        // Find stressed word (RMS peak)
+        val peakRmsPos = capturedRmsCurve.indices.maxByOrNull { capturedRmsCurve[it] } ?: -1
+        val stressIdx = if (peakRmsPos >= 0)
+            (peakRmsPos.toFloat() / 9f * (n - 1)).toInt().coerceIn(0, n - 1) else -1
+
+        val sb = StringBuilder("<speak>")
         words.forEachIndexed { i, word ->
-            // Stress: only at measured RMS peak (natural emphasis)
-            val isStressed = (i == stressWordIdx)
+            val t        = i.toFloat() / (n - 1).coerceAtLeast(1)
+            val curvePos = (t * 9).toInt().coerceIn(0, 9)
+            val rmsHere  = capturedRmsCurve[curvePos]
 
-            // Pauses from punctuation (these work well on Android TTS)
+            // Per-word rate from RMS energy:
+            // High RMS = speaker is stressing this word = speak slower (hold longer)
+            // Low RMS = unstressed syllable = speak faster (clip it)
+            // This is exactly how natural speech works — prosody via duration
+            val normRms = ((rmsHere - minRms) / rmsRange).coerceIn(0f, 1f)
+            val wordRate: String = when {
+                normRms > 0.80f -> "slow"      // very stressed — hold it
+                normRms > 0.55f -> "medium"    // moderately stressed
+                normRms > 0.25f -> "fast"      // light syllable
+                else            -> "x-fast"    // unstressed filler
+            }
+
+            // Stress emphasis at RMS peak
+            val isStressed = (i == stressIdx)
+
+            // Punctuation pauses
             val breakAfter = when (word.lastOrNull()) {
                 '.', '!', '?', '।', '॥' -> "<break time='180ms'/>"
                 ','                       -> "<break time='80ms'/>"
@@ -824,18 +839,18 @@ object HindiTtsService {
                 else                      -> ""
             }
 
-            if (isStressed) {
-                sb.append("<emphasis level='moderate'>${esc(word)}</emphasis>")
-            } else {
-                sb.append(esc(word))
-            }
-            sb.append(breakAfter)
+            sb.append("<prosody rate='$wordRate'>")
+            if (isStressed) sb.append("<emphasis level='moderate'>${esc(word)}</emphasis>")
+            else            sb.append(esc(word))
+            sb.append("</prosody>$breakAfter")
             if (i < n - 1) sb.append(" ")
         }
 
-        sb.append("</prosody></speak>")
+        sb.append("</speak>")
         return sb.toString()
     }
+
+
 
 
 
@@ -909,11 +924,21 @@ object HindiTtsService {
                     putInt(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_STREAM, 3)
                 }
                 CaptionLogger.log(TAG, "SSML-EXPRESSIVE: ${item.emotion}")
+            } else if (capturedRmsCurve.any { it > 0f }) {
+                // Have RMS curve data: use SSML with per-word RATE variation
+                // Rate changes sound natural on Android TTS (duration prosody)
+                // Pitch stays fixed at sentence level via setPitch() above
+                inputText = buildSsml(safeText, item.pitch,
+                    capturedStartF0, capturedPeakF0, capturedEndF0, naturalF0)
+                inputBundle = android.os.Bundle().apply {
+                    putInt(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_STREAM, 3)
+                }
+                CaptionLogger.log(TAG, "RATE-SSML pitch=${String.format("%.2f", item.pitch)}")
             } else {
-                // Plain text — setPitch and setSpeechRate set above handle prosody
+                // No curve data: plain text (setPitch/setSpeechRate handle everything)
                 inputText   = safeText
                 inputBundle = null
-                CaptionLogger.log(TAG, "PLAIN-TTS pitch=${String.format("%.2f", item.pitch)} rate=${String.format("%.2f", item.rate)}")
+                CaptionLogger.log(TAG, "PLAIN-TTS pitch=${String.format("%.2f", item.pitch)}")
             }
 
             // Bridge Android TTS callback to coroutine
