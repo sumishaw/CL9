@@ -38,6 +38,12 @@ class LiveCaptionReader : AccessibilityService() {
         // 3s: enough for user to dismiss and return to video.
         // If LC stays gone > 3s → video genuinely ended/paused → confirm gone.
         private const val LC_GONE_GRACE_MS  = 5_000L  // 5s: covers brief app switches
+        // Live Caption's accessibility node exposes the FULL running transcript,
+        // not just the visible line, so it grows continuously through a long
+        // conversation. This must stay far above any realistic transcript length —
+        // previously 500 chars, which any conversation exceeds within under a
+        // minute, silently freezing the reader forever (see validCaption()).
+        private const val MAX_CAPTION_LEN   = 20_000
         private const val LANG_CONFIRM        = 5   // 5 consecutive: prevents single-word flicker
         private const val LANG_CONFIRM_LOCKED  = 999  // never switches when locked
         private const val QUEUE_CAP        = 500  // never flush while running — FIFO backlog
@@ -927,12 +933,33 @@ class LiveCaptionReader : AccessibilityService() {
     }
 
     private fun validCaption(t: String): Boolean {
-        if (t.length < 2 || t.length > 500) return false
+        // CRITICAL FIX: Google Live Caption's accessibility node text is the FULL
+        // running transcript (not just the visible on-screen line) — it keeps
+        // growing as the conversation continues. The old cap of 500 chars meant
+        // that after ~30-60s of continuous dialogue, this node was silently
+        // rejected FOREVER (no log line existed for this rejection), nodes.filter
+        // came back empty, maxByOrNull returned null, and readWindow() returned
+        // null on every single poll from then on — a permanent, silent freeze
+        // with zero error output. Raised drastically; our own word-count-based
+        // "untranslated tail" tracking downstream already handles arbitrarily
+        // long transcripts safely, so there's no reason to reject long text here.
+        if (t.length < 2) return false
+        if (t.length > MAX_CAPTION_LEN) {
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastLenRejectLogMs > 5_000L) {
+                lastLenRejectLogMs = nowMs
+                CaptionLogger.log(TAG, "REJECT: caption text len=${t.length} exceeds MAX_CAPTION_LEN=$MAX_CAPTION_LEN",
+                    CaptionLogger.LEVEL_WARN)
+            }
+            return false
+        }
         if (t.count { it.isLetter() } < 2) return false
         if (t.contains("com.android") || t.contains("com.google")) return false
         if (t.contains("http") || t.contains("www.")) return false
         return true
     }
+
+    private var lastLenRejectLogMs = 0L
 
     private fun detectScript(text: String): String {
         var ja = 0; var zh = 0; var ko = 0; var ar = 0; var ru = 0; var hi = 0
