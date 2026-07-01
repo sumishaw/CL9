@@ -595,66 +595,95 @@ object HindiTtsService {
                            startF0: Float, peakF0: Float, endF0: Float,
                            naturalF0: Float): String {
 
-        // Convert absolute F0 values to percentage offsets from TTS baseline
-        fun f0ToPct(f0: Float): String {
-            if (f0 <= 0f) return "+0%"
-            val ratio = (f0 / naturalF0) * basePitch
-            val pct   = ((ratio - 1.0f) * 100f).toInt().coerceIn(-50, 80)
-            return if (pct >= 0) "+${pct}%" else "${pct}%"
-        }
-
-        val startPct = f0ToPct(startF0)
-        val peakPct  = f0ToPct(peakF0)
-        val endPct   = f0ToPct(endF0)
-
-        // Determine contour type
-        val rising  = endF0 > 0f && startF0 > 0f && endF0 > startF0 * 1.08f
-        val falling = endF0 > 0f && startF0 > 0f && endF0 < startF0 * 0.92f
-        val peaked  = peakF0 > 0f && startF0 > 0f && peakF0 > startF0 * 1.15f &&
-                      (endF0 <= 0f || endF0 < peakF0 * 0.90f)
-        val flat    = !rising && !falling && !peaked
-
-        // No contour data → simple flat SSML with just the base pitch
-        if (startF0 <= 0f && peakF0 <= 0f && endF0 <= 0f || flat) {
-            val bPct = f0ToPct(if (currentMeasuredF0 > 0f) currentMeasuredF0 else naturalF0)
-            return "<speak><prosody pitch='$bPct'>${android.text.Html.escapeHtml(text)}</prosody></speak>"
-        }
-
-        // Split into 3 sections: beginning / middle / end
-        val words  = text.split(" ").filter { it.isNotBlank() }
-        val n      = words.size
-        if (n < 3) {
-            // Too short to split — use peak pitch for single/double word
-            val p = if (peaked) peakPct else if (rising) endPct else startPct
-            return "<speak><prosody pitch='$p'>${android.text.Html.escapeHtml(text)}</prosody></speak>"
-        }
-
-        val cut1 = n / 3
-        val cut2 = 2 * n / 3
-        val seg1 = words.subList(0, cut1).joinToString(" ")
-        val seg2 = words.subList(cut1, cut2).joinToString(" ")
-        val seg3 = words.subList(cut2, n).joinToString(" ")
-
         fun esc(s: String) = android.text.Html.escapeHtml(s)
 
-        return when {
-            rising  -> "<speak>" +
-                "<prosody pitch='$startPct'>${esc(seg1)}</prosody> " +
-                "<prosody pitch='${f0ToPct((startF0+endF0)/2)}'>${esc(seg2)}</prosody> " +
-                "<prosody pitch='$endPct'>${esc(seg3)}</prosody>" +
-                "</speak>"
-            falling -> "<speak>" +
-                "<prosody pitch='$startPct'>${esc(seg1)}</prosody> " +
-                "<prosody pitch='${f0ToPct((startF0+endF0)/2)}'>${esc(seg2)}</prosody> " +
-                "<prosody pitch='$endPct'>${esc(seg3)}</prosody>" +
-                "</speak>"
-            peaked  -> "<speak>" +
-                "<prosody pitch='$startPct'>${esc(seg1)}</prosody> " +
-                "<prosody pitch='$peakPct'>${esc(seg2)}</prosody> " +
-                "<prosody pitch='$endPct'>${esc(seg3)}</prosody>" +
-                "</speak>"
-            else    -> "<speak><prosody pitch='$startPct'>${esc(text)}</prosody></speak>"
+        // F0 → SSML pitch percentage offset from TTS baseline
+        fun f0ToPct(f0: Float): Int {
+            if (f0 <= 0f) return 0
+            val ratio = (f0 / naturalF0) * basePitch
+            return ((ratio - 1.0f) * 100f).toInt().coerceIn(-45, 75)
         }
+        fun pctStr(pct: Int) = if (pct >= 0) "+${pct}%" else "${pct}%"
+
+        // No contour data → flat SSML at base pitch only
+        val hasContour = startF0 > 0f || peakF0 > 0f || endF0 > 0f
+        if (!hasContour) {
+            val bPct = f0ToPct(if (currentMeasuredF0 > 0f) currentMeasuredF0 else naturalF0)
+            return "<speak><prosody pitch='${pctStr(bPct)}'>${esc(text)}</prosody></speak>"
+        }
+
+        val words = text.split(" ").filter { it.isNotBlank() }
+        val n = words.size
+        if (n == 0) return "<speak>${esc(text)}</speak>"
+
+        // Determine contour shape for rate hints
+        val sF0 = if (startF0 > 0f) startF0 else currentMeasuredF0
+        val pF0 = if (peakF0 > 0f) peakF0 else sF0
+        val eF0 = if (endF0 > 0f) endF0 else sF0
+        val peakPos = if (n > 1) n / 2 else 0   // assume peak at middle
+
+        // ── PER-WORD SSML with interpolated pitch + stress + duration ─────────
+        // For each word at position i:
+        //   pitch: interpolate along the start→peak→end F0 curve
+        //   rate: stressed (peak position) = slightly slower (duration stretches)
+        //         unstressed filler words (short) = slightly faster
+        //   emphasis: word at peak position gets <emphasis level='moderate'>
+        //
+        // This gives EACH WORD its own pitch and duration, closely following
+        // the original speaker's prosodic contour — not just 3 broad sections.
+        val sb = StringBuilder("<speak>")
+
+        // Short filler words that are naturally unstressed/fast in Hindi dialogue
+        val fillers = setOf("में","है","का","की","के","को","से","और","एक","यह","वह",
+                            "तो","भी","ही","पर","अब","था","थी","थे","हो","हैं")
+
+        words.forEachIndexed { i, word ->
+            val t = i.toFloat() / (n - 1).coerceAtLeast(1)
+
+            // Interpolate F0: start → peak (first half) → end (second half)
+            val interpF0 = if (t <= 0.5f) {
+                sF0 + (pF0 - sF0) * (t * 2f)
+            } else {
+                pF0 + (eF0 - pF0) * ((t - 0.5f) * 2f)
+            }
+            val pitchPct = f0ToPct(interpF0)
+
+            // Is this the stressed/peak word?
+            val isStressed = i == peakPos && pF0 > sF0 * 1.10f
+
+            // Rate: stressed word gets slower (longer duration = more weight)
+            // Filler words get faster (natural unstressed shortening)
+            val cleanWord = word.trimEnd('.', ',', '!', '?', '।', '—', '-')
+            val isFiller  = cleanWord in fillers
+            val rate = when {
+                isStressed -> "slow"
+                isFiller   -> "fast"
+                else       -> "medium"
+            }
+
+            // Pause after sentence-ending punctuation
+            val lastChar = word.lastOrNull()
+            val breakAfter = when (lastChar) {
+                '.', '!', '?', '।', '॥' -> "<break time='180ms'/>"
+                ','                       -> "<break time='80ms'/>"
+                ';', '—'                 -> "<break time='120ms'/>"
+                else                      -> ""
+            }
+
+            // Build per-word tag
+            sb.append("<prosody pitch='${pctStr(pitchPct)}' rate='$rate'>")
+            if (isStressed) {
+                sb.append("<emphasis level='moderate'>${esc(word)}</emphasis>")
+            } else {
+                sb.append(esc(word))
+            }
+            sb.append("</prosody>")
+            sb.append(breakAfter)
+            if (i < n - 1) sb.append(" ")
+        }
+
+        sb.append("</speak>")
+        return sb.toString()
     }
 
     private suspend fun synthesizeToFile(item: FetchItem): File? =
