@@ -183,6 +183,19 @@ class LiveCaptionReader : AccessibilityService() {
     private var pendingLang   = ""
     private var pendingCount  = 0
 
+    // ── Language Lock ─────────────────────────────────────────────────────────
+    // When set, ignores LC's language detection entirely and forces this lang.
+    // Prevents mid-video flicker when LC briefly misdetects a word as another language.
+    // "" = auto (use LC detection with LANG_CONFIRM debounce)
+    // "latin_en" | "ja" | "zh" | "ko" | "ar" | "ru" | "hi" | "latin_foreign" = locked
+    @Volatile var lockedLang: String = ""
+
+    // Raise confirm threshold when NOT locked — 3 consecutive detections needed
+    // to switch language. Prevents single-word misdetection from triggering switch.
+    // When locked, detection is bypassed entirely.
+    private const val LANG_CONFIRM_LOCKED = 999   // effectively never switches when locked
+    private val effectiveLangConfirm get() = if (lockedLang.isNotEmpty()) LANG_CONFIRM_LOCKED else LANG_CONFIRM
+
     // Window state
     private var lastRawFull           = ""
     private var lastSentText          = ""
@@ -418,8 +431,13 @@ class LiveCaptionReader : AccessibilityService() {
 
     private fun schedule(text: String) {
         // ── Language detection ────────────────────────────────────────────────
-        val script = detectScript(text)
-        if (script != confirmedLang) {
+        val script = if (lockedLang.isNotEmpty()) lockedLang else detectScript(text)
+
+        if (lockedLang.isNotEmpty() && confirmedLang != lockedLang) {
+            // Language was just locked — force immediate switch
+            confirmedLang = lockedLang; pendingLang = ""; pendingCount = 0
+            CaptionLogger.log(TAG, "LANG-LOCKED → $lockedLang")
+        } else if (script != confirmedLang) {
             if (script == pendingLang) {
                 if (++pendingCount >= LANG_CONFIRM) {
                     CaptionLogger.log(TAG, "LANG $confirmedLang->$script")
@@ -428,7 +446,7 @@ class LiveCaptionReader : AccessibilityService() {
                     sentenceBuffer = ""; lastBufferEnqueued = ""
                     lastEnqueuedWordCount = 0; lastEnqueuedText = ""
                     lastSubmitTotalWords = 0; lastSubmitMs = 0L; lastForcedMs = 0L
-                    queue.clear()  // FIFO: expectedSeq NOT reset — old sentences still valid
+                    queue.clear()
                 }
             } else { pendingLang = script; pendingCount = 1 }
         } else { pendingLang = ""; pendingCount = 0 }
