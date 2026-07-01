@@ -54,7 +54,18 @@ object HindiTtsService {
         SINGING, GASPING, PANTING, MOANING,
         STRAINED, GRAVELLY, RASPY, HUSKY,
         WHISPERY, MURMURED, HUSHED, BREATHY,
-        SULTRY, TENDER, VELVETY, DISGUST
+        SULTRY, TENDER, VELVETY, DISGUST,
+        // New expressive emotions
+        CRYING,      // tearful, voice breaks — high trembling pitch, slow, unstable
+        SHOUTING,    // yelling — very high energy, fast, clipped
+        LAUGHING,    // bright, rhythmic, high pitch bursts
+        SOBBING,     // deep grief — very low, very slow, broken
+        PLEADING,    // begging — rising desperate pitch, fast
+        COMMANDING,  // authoritative — low firm pitch, slower deliberate pace
+        WHINING,     // complaining — nasal-like high pitch, drawn out
+        TAUNTING,    // mocking — slightly sing-song, high pitch, slow
+        PANICKING,   // extreme fear/rush — very fast, very high, irregular
+        CONSOLING    // calming another — soft, low, warm, slow
     }
 
     enum class Gender { AUTO, MALE, FEMALE }
@@ -493,6 +504,93 @@ object HindiTtsService {
     //   PEAKED  (peakF0 >> startF0 & endF0): emphasis in the middle
     //   FLAT    (all similar): calm, neutral — minimal prosody tags
     //
+    // Build SSML with emotion-specific texture BEYOND just pitch/rate
+    // SSML <break>, <emphasis>, and per-word <prosody> give expressive emotions
+    // texture that setPitch() alone cannot achieve.
+    private fun emotionSsml(text: String, emotion: Emotion, basePitchPct: String): String {
+        val esc = android.text.Html.escapeHtml(text)
+        return when (emotion) {
+            Emotion.CRYING -> {
+                // Voice breaks: insert small pauses between word groups
+                val words = text.split(" ")
+                val tagged = words.mapIndexed { i, w ->
+                    val br = if (i > 0 && i % 3 == 0) "<break time='120ms'/>" else ""
+                    "$br<prosody pitch='${if (i % 2 == 0) basePitchPct else "+35%"}'>" +
+                    android.text.Html.escapeHtml(w) + "</prosody>"
+                }.joinToString(" ")
+                "<speak><prosody rate='slow'>$tagged</prosody></speak>"
+            }
+            Emotion.SOBBING -> {
+                // Deep grief: long breaks, dropping pitch
+                val words = text.split(" ")
+                val tagged = words.mapIndexed { i, w ->
+                    val br = if (i % 4 == 0 && i > 0) "<break time='250ms'/>" else ""
+                    "$br${android.text.Html.escapeHtml(w)}"
+                }.joinToString(" ")
+                "<speak><prosody pitch='-28%' rate='x-slow'>$tagged</prosody></speak>"
+            }
+            Emotion.SHOUTING -> {
+                // Every word emphasised, clipped
+                val tagged = text.split(" ").joinToString(" ") { w ->
+                    "<emphasis level='strong'>${android.text.Html.escapeHtml(w)}</emphasis>"
+                }
+                "<speak><prosody pitch='+8%' rate='fast'>$tagged</prosody></speak>"
+            }
+            Emotion.PANICKING -> {
+                // No pauses, very compressed, high pitch
+                "<speak><prosody pitch='+30%' rate='x-fast'>$esc</prosody></speak>"
+            }
+            Emotion.PLEADING -> {
+                // Rises urgently across the phrase
+                val words = text.split(" ")
+                val n = words.size.coerceAtLeast(1)
+                val tagged = words.mapIndexed { i, w ->
+                    val pct = -5 + (i * 30 / n)
+                    "<prosody pitch='${if(pct>=0)"+${pct}%" else "${pct}%"}'>" +
+                    android.text.Html.escapeHtml(w) + "</prosody>"
+                }.joinToString(" ")
+                "<speak><prosody rate='medium-fast'>$tagged</prosody></speak>"
+            }
+            Emotion.COMMANDING -> {
+                // Strong emphasis on key words (every other), slow deliberate
+                val words = text.split(" ")
+                val tagged = words.mapIndexed { i, w ->
+                    if (i % 2 == 0)
+                        "<emphasis level='strong'>${android.text.Html.escapeHtml(w)}</emphasis>"
+                    else android.text.Html.escapeHtml(w)
+                }.joinToString(" ")
+                "<speak><prosody pitch='-18%' rate='slow'>$tagged</prosody></speak>"
+            }
+            Emotion.TAUNTING -> {
+                // Sing-song: alternating high-low pitch across words
+                val words = text.split(" ")
+                val tagged = words.mapIndexed { i, w ->
+                    val p = if (i % 2 == 0) "+22%" else "+5%"
+                    "<prosody pitch='$p'>${android.text.Html.escapeHtml(w)}</prosody>"
+                }.joinToString(" ")
+                "<speak><prosody rate='slow'>$tagged</prosody></speak>"
+            }
+            Emotion.WHINING -> {
+                // Drawn out, high pitch, add stretch
+                "<speak><prosody pitch='+28%' rate='slow'>$esc</prosody></speak>"
+            }
+            Emotion.LAUGHING -> {
+                // Bright, rhythmic breaks between phrases
+                val words = text.split(" ")
+                val tagged = words.mapIndexed { i, w ->
+                    val br = if (i > 0 && i % 4 == 0) "<break time='80ms'/>" else ""
+                    "$br${android.text.Html.escapeHtml(w)}"
+                }.joinToString(" ")
+                "<speak><prosody pitch='+26%' rate='fast'>$tagged</prosody></speak>"
+            }
+            Emotion.CONSOLING -> {
+                // Warm, falling reassurance
+                "<speak><prosody pitch='-8%' rate='slow'><emphasis level='reduced'>$esc</emphasis></prosody></speak>"
+            }
+            else -> null  // use standard F0-contour SSML below
+        }
+    }
+
     private fun buildSsml(text: String, basePitch: Float,
                            startF0: Float, peakF0: Float, endF0: Float,
                            naturalF0: Float): String {
@@ -590,7 +688,19 @@ object HindiTtsService {
             val hasCapturedContour = capturedStartF0 > 0f || capturedPeakF0 > 0f
             val inputText: String
             val inputBundle: android.os.Bundle?
-            if (hasCapturedContour) {
+
+            // Expressive emotions get special SSML texture (breaks, emphasis, contours)
+            val expressiveSsml = emotionSsml(item.text, item.emotion,
+                run { val pct = ((item.pitch - 1f) * 100f).toInt()
+                      if (pct >= 0) "+${pct}%" else "${pct}%" })
+
+            if (expressiveSsml != null) {
+                inputText   = expressiveSsml
+                inputBundle = android.os.Bundle().apply {
+                    putInt(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_STREAM, 3)
+                }
+                CaptionLogger.log(TAG, "SSML-EXPRESSIVE: ${item.emotion}")
+            } else if (hasCapturedContour) {
                 inputText = buildSsml(item.text, item.pitch,
                     capturedStartF0, capturedPeakF0, capturedEndF0, naturalF0)
                 inputBundle = android.os.Bundle().apply {
@@ -757,6 +867,19 @@ object HindiTtsService {
         Emotion.TENDER     -> Pair(0.95f, 0.80f)   // gentle, soft
         Emotion.VELVETY    -> Pair(0.83f, 0.78f)   // smooth, low, slow
         Emotion.DISGUST    -> Pair(0.86f, 1.12f)   // low, sharp, clipped
+
+        // ── Expressive emotions (new) ─────────────────────────────────────────
+        // These use SSML inside buildSsml() for additional texture beyond pitch/rate
+        Emotion.CRYING     -> Pair(1.25f, 0.72f)   // high trembling pitch, slow breaks
+        Emotion.SHOUTING   -> Pair(0.92f, 1.45f)   // forceful, very fast, clipped words
+        Emotion.LAUGHING   -> Pair(1.30f, 1.30f)   // bright high pitch, fast rhythmic
+        Emotion.SOBBING    -> Pair(0.68f, 0.60f)   // very low, very slow, broken pauses
+        Emotion.PLEADING   -> Pair(1.28f, 1.20f)   // desperate rising pitch, urgent pace
+        Emotion.COMMANDING -> Pair(0.78f, 0.88f)   // low firm authoritative, deliberate
+        Emotion.WHINING    -> Pair(1.32f, 0.85f)   // high drawn-out nasal-ish
+        Emotion.TAUNTING   -> Pair(1.18f, 0.80f)   // sing-song slow mock
+        Emotion.PANICKING  -> Pair(1.38f, 1.55f)   // very high, extremely fast
+        Emotion.CONSOLING  -> Pair(0.88f, 0.78f)   // soft low warm slow
     }
 
     // ── WAV helpers ───────────────────────────────────────────────────────────
